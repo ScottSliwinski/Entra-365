@@ -159,7 +159,7 @@ function Resolve-AD($upn,$dc) {
 function Get-DirectAD($u,$dc) {
     foreach ($dn in @($u.memberOf)) {
         $g=Get-ADGroup -Identity $dn -Server $dc -Properties adminCount
-        [pscustomobject]@{ Key="AD:$($g.ObjectGUID)"; Id=$g.DistinguishedName; Name=$g.Name; Location='Windows AD'; Server=$dc; Protected=($g.adminCount -eq 1); Reason='' }
+        [pscustomobject]@{ Key="AD:$($g.ObjectGUID)"; Id=$g.DistinguishedName; SID=$g.SID.Value; Name=$g.Name; Location='Windows AD'; Server=$dc; Protected=($g.adminCount -eq 1); Reason='' }
     }
 }
 function Graph-Pages($uri) {
@@ -186,7 +186,7 @@ function Get-DirectCloud($u) {
         elseif ($g.isAssignableToRole) { $reason='Role-assignable group: excluded' }
         elseif ($g.mailEnabled -and @($g.groupTypes) -notcontains 'Unified') { $reason='Cloud mail-enabled security / distribution: use Exchange' }
         elseif (-not $g.securityEnabled -and @($g.groupTypes) -notcontains 'Unified') { $reason='Unsupported cloud group type' }
-        [pscustomobject]@{ Key="Cloud:$($g.id)"; Id=$g.id; Name=$g.displayName; Location='Entra cloud'; Server=''; Protected=$false; Reason=$reason }
+        [pscustomobject]@{ Key="Cloud:$($g.id)"; Id=$g.id; SID=[string]$g.onPremisesSecurityIdentifier; Name=$g.displayName; Location='Entra cloud'; Server=''; Protected=$false; Reason=$reason }
     }
 }
 function Options-Key { "$($source.Text.Trim())|$($target.Text.Trim())|$($server.Text.Trim())|$($tenant.Text.Trim())|$($cloud.Checked)|$($clear.Checked)|$($only.Checked)" }
@@ -201,14 +201,14 @@ function Load-State {
     $s=$null; $sp=$null; $sg=@(); $tg=@(Get-DirectAD $t $dc); $tc=$null
     $primarySid=$t.SID.Value.Substring(0,$t.SID.Value.LastIndexOf('-'))+'-'+$t.primaryGroupID
     $primary=Get-ADGroup -Identity $primarySid -Server $dc
-    $tg+= [pscustomobject]@{ Key="AD:$($primary.ObjectGUID)"; Id=$primary.DistinguishedName; Name=$primary.Name; Location='Windows AD'; Server=$dc; Protected=$true; Reason='Primary group: always preserved' }
+    $tg+= [pscustomobject]@{ Key="AD:$($primary.ObjectGUID)"; Id=$primary.DistinguishedName; SID=$primary.SID.Value; Name=$primary.Name; Location='Windows AD'; Server=$dc; Protected=$true; Reason='Primary group: always preserved' }
     if (-not $only.Checked) {
         $s=Resolve-AD $source.Text.Trim() $dc
         if ($s.ObjectGUID -eq $t.ObjectGUID) { throw 'Source and target must be different users.' }
         $sg=@(Get-DirectAD $s $dc)
         $sourcePrimarySid=$s.SID.Value.Substring(0,$s.SID.Value.LastIndexOf('-'))+'-'+$s.primaryGroupID
         $sourcePrimary=Get-ADGroup -Identity $sourcePrimarySid -Server $dc
-        $sp=[pscustomobject]@{ Name=$sourcePrimary.Name; Location='Windows AD'; Protected=$true; Reason='Primary group: shown for reference; not copied' }
+        $sp=[pscustomobject]@{ Name=$sourcePrimary.Name; SID=$sourcePrimary.SID.Value; Location='Windows AD'; Protected=$true; Reason='Primary group: shown for reference; not copied' }
     }
     if ($cloud.Checked) {
         $tid=[guid]::Empty
@@ -217,10 +217,20 @@ function Load-State {
         $ctx=Get-MgContext
         if (-not $ctx -or $ctx.TenantId -ne $tid.ToString() -or @($ctx.Scopes) -notcontains 'GroupMember.ReadWrite.All' -or @($ctx.Scopes) -notcontains 'Group.Read.All' -or @($ctx.Scopes) -notcontains 'User.Read.All') {
             if ($ctx) { Disconnect-MgGraph | Out-Null }
-            Note 'Entra sign-in: follow the device-code instructions in the PowerShell window.'
-            Connect-MgGraph -TenantId $tid.ToString() -Scopes 'User.Read.All','Group.Read.All','GroupMember.ReadWrite.All' -UseDeviceCode -ContextScope Process -NoWelcome
+            Note 'Opening Microsoft sign-in. Complete authentication in the browser or Microsoft account window (check behind this GUI).'
+            $form.Refresh()
+            try {
+                # Interactive authentication opens the browser/account prompt.
+                # Device-code authentication does not open a sign-in window.
+                Connect-MgGraph -TenantId $tid.ToString() -Scopes 'User.Read.All','Group.Read.All','GroupMember.ReadWrite.All' -ContextScope Process -NoWelcome -ErrorAction Stop
+            } catch {
+                throw "Microsoft Graph sign-in failed: $($_.Exception.Message)"
+            }
         }
-        if ((Get-MgContext).TenantId -ne $tid.ToString()) { throw 'Connected Graph tenant differs from the expected tenant.' }
+        $ctx=Get-MgContext
+        if (-not $ctx) { throw 'Microsoft Graph sign-in did not establish a session. Preview stopped.' }
+        if ($ctx.TenantId -ne $tid.ToString()) { throw 'Connected Graph tenant differs from the expected tenant.' }
+        Note "Connected to Entra as $($ctx.Account). Loading cloud group memberships..."
         $tc=Cloud-User $t
         $tg+=@(Get-DirectCloud $tc)
         if ($s) { $sc=Cloud-User $s; $sg+=@(Get-DirectCloud $sc) }
@@ -237,28 +247,44 @@ function Add-Row($g,$action) {
     $row.GroupId=$g.Key; $row.Reason=$reason; $row.Result='Pending'
     $script:rows.Rows.Add($row); $script:items[$g.Key]=$g
 }
+function Get-DisplayMemberships($groups) {
+    # Match the immutable on-premises SID, never the display name: distinct
+    # AD and cloud-only groups can legitimately have identical names.
+    $adSids=@{}
+    foreach ($g in $groups) {
+        if ($g.Location -eq 'Windows AD' -and $g.PSObject.Properties['SID'] -and $g.SID) { $adSids[[string]$g.SID]=$true }
+    }
+    foreach ($g in $groups) {
+        if ($g.Location -eq 'Entra cloud' -and $g.PSObject.Properties['SID'] -and $g.SID -and $adSids.ContainsKey([string]$g.SID)) { continue }
+        $g
+    }
+}
 function Make-Preview($state) {
     $script:rows.Clear(); $script:items=@{}
     $sourceKeys=@($state.SourceGroups | ForEach-Object { $_.Key })
     $targetKeys=@($state.TargetGroups | ForEach-Object { $_.Key })
     foreach ($g in $state.SourceGroups) {
-        if ($targetKeys -contains $g.Key) {
-            $existing=@($state.TargetGroups | Where-Object Key -eq $g.Key)[0]
-            if ($existing.Reason -eq 'Primary group: always preserved') { Add-Row $existing 'Skip' } else { Add-Row $g 'Keep' }
-        } else { Add-Row $g 'Add' }
+        # Shared memberships need no action. Synced cloud entries are already
+        # represented by their authoritative Windows AD memberships.
+        if ($targetKeys -contains $g.Key) { continue }
+        if ($g.Reason -eq 'Synced / previously synced: manage in AD') { continue }
+        Add-Row $g 'Add'
     }
     foreach ($g in $state.TargetGroups) {
         if ($sourceKeys -contains $g.Key) { continue }
+        if ($g.Reason -in @('Primary group: always preserved','Synced / previously synced: manage in AD')) { continue }
         if ($only.Checked -or $clear.Checked) { Add-Row $g 'Remove' } else { Add-Row $g 'Keep' }
     }
     $displaySource=@($state.SourceGroups)
     if ($state.SourcePrimary) { $displaySource+= $state.SourcePrimary }
+    $displaySource=@(Get-DisplayMemberships $displaySource)
+    $displayTarget=@(Get-DisplayMemberships $state.TargetGroups)
     Fill-MembershipGrid $sourceGrid $displaySource
-    Fill-MembershipGrid $targetGrid $state.TargetGroups
+    Fill-MembershipGrid $targetGrid $displayTarget
     if ($state.Source) { $sourceBox.Text="SOURCE (read-only): $($state.Source.UserPrincipalName) - $($displaySource.Count) groups" }
     else { $sourceBox.Text='SOURCE - not used in Clear TARGET groups only mode' }
-    $targetBox.Text="TARGET: $($state.Target.UserPrincipalName) - $($state.TargetGroups.Count) groups"
-    $actionsBox.Text="Proposed actions - ONLY for $($state.Target.UserPrincipalName)"
+    $targetBox.Text="TARGET: $($state.Target.UserPrincipalName) - $($displayTarget.Count) groups"
+    $actionsBox.Text="Membership differences - ONLY for $($state.Target.UserPrincipalName) (shared groups hidden)"
     $script:preview=$state
 }
 function Save-Table($path) {
