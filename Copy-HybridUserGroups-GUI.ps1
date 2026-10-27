@@ -5,7 +5,7 @@ joined PC with RSAT ActiveDirectory. No modules are installed automatically.
 Optional cloud support requires Microsoft.Graph.Authentication.
 Both AD users must be in the selected AD domain. Different UPN suffixes are OK.
 Direct memberships only; preserves primary group. Does not copy ownership,
-mailbox permissions, directory roles, individual licenses, or user attributes.
+mailbox permissions, directory roles, individual licenses, or other user attributes. Optional organizational fields are written in AD.
 Additions run before removals. If any addition fails, all removals are withheld.
 No automatic rollback. CSV snapshots and results are written before/after changes.
 Cloud dynamic, role-assignable, synced and mail-enabled non-M365 groups are skipped.
@@ -33,15 +33,15 @@ $script:preview = $null
 $script:busy = $false
 $script:rows = New-Object System.Data.DataTable
 [void]$script:rows.Columns.Add('Select',[bool])
-foreach ($name in 'Action','Location','Group','GroupId','Reason','Result') { [void]$script:rows.Columns.Add($name,[string]) }
+foreach ($name in 'Action','Location','Group','Before','After','GroupId','Reason','Result') { [void]$script:rows.Columns.Add($name,[string]) }
 $script:items = @{}
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Hybrid AD / Entra - Copy User Groups'
+$form.Text = 'Hybrid AD / Entra - Copy Groups and Organization'
 $form.Size = New-Object Drawing.Size(1120,960)
 $form.MinimumSize = New-Object Drawing.Size(1080,820)
 $form.StartPosition = 'CenterScreen'
 $top = New-Object Windows.Forms.Panel
-$top.Dock = 'Top'; $top.Height = 240; $form.Controls.Add($top)
+$top.Dock = 'Top'; $top.Height = 305; $form.Controls.Add($top)
 function Label($text,$x,$y,$width=170) {
     $c = New-Object Windows.Forms.Label
     $c.Text=$text; $c.Location=New-Object Drawing.Point($x,$y); $c.Size=New-Object Drawing.Size($width,22)
@@ -73,6 +73,10 @@ $test=Check 'Test mode - preview actions without changes' 550 118 $true
 Label 'Direct memberships only. Both AD users must be in the selected AD domain; UPN suffixes can differ.' 15 155 1040
 Label 'Protected AD groups are unchecked by default. Primary, dynamic and unsupported cloud groups are preserved.' 15 179 1040
 Label 'All Add / Remove actions affect ONLY the TARGET UPN. The SOURCE account is read-only.' 15 207 1040
+$org=Check 'Copy organizational fields (review each proposed update)' 15 238 $false 530
+$employee=Check 'Also copy Employee ID (optional / contractors)' 550 238 $false 510
+Label 'Blank source fields are preserved on the target. Employee ID is copied only when explicitly enabled.' 15 271 1040
+$employee.Enabled=$false
 $bottom=New-Object Windows.Forms.Panel
 $bottom.Dock='Bottom'; $bottom.Height=100; $form.Controls.Add($bottom)
 $status=New-Object Windows.Forms.Label
@@ -88,10 +92,11 @@ $grid.Dock='Fill'; $grid.AutoGenerateColumns=$false
 $grid.AllowUserToAddRows=$false; $grid.AllowUserToDeleteRows=$false
 $grid.AutoSizeColumnsMode='Fill'; $grid.RowHeadersVisible=$false
 # Create columns before binding: auto-generated columns may not exist until shown.
-foreach ($name in 'Select','Action','Location','Group','GroupId','Reason','Result') {
+foreach ($name in 'Select','Action','Location','Group','Before','After','GroupId','Reason','Result') {
     if ($name -eq 'Select') { $column=New-Object Windows.Forms.DataGridViewCheckBoxColumn }
     else { $column=New-Object Windows.Forms.DataGridViewTextBoxColumn }
     $column.Name=$name; $column.HeaderText=$name; $column.DataPropertyName=$name
+    if ($name -eq 'Group') { $column.HeaderText='Group / Field' }
     $column.ReadOnly=($name -ne 'Select')
     if ($name -eq 'Select') { $column.FillWeight=35 }
     if ($name -eq 'GroupId') { $column.Visible=$false }
@@ -152,7 +157,7 @@ function Busy($value) { $script:busy=$value; $top.Enabled= -not $value; $bottom.
 function Escape-Ldap($s) { $s.Replace('\','\5c').Replace('*','\2a').Replace('(','\28').Replace(')','\29').Replace([string][char]0,'\00') }
 function Resolve-AD($upn,$dc) {
     if ([string]::IsNullOrWhiteSpace($upn)) { throw 'Enter the required UPN.' }
-    $users=@(Get-ADUser -LDAPFilter "(userPrincipalName=$(Escape-Ldap $upn))" -Server $dc -Properties memberOf,primaryGroupID,Enabled)
+    $users=@(Get-ADUser -LDAPFilter "(userPrincipalName=$(Escape-Ldap $upn))" -Server $dc -Properties memberOf,primaryGroupID,Enabled,Title,Company,Department,Office,EmployeeID,Manager)
     if ($users.Count -ne 1) { throw "UPN '$upn' did not resolve uniquely in AD domain/DC '$dc'." }
     return $users[0]
 }
@@ -189,7 +194,7 @@ function Get-DirectCloud($u) {
         [pscustomobject]@{ Key="Cloud:$($g.id)"; Id=$g.id; SID=[string]$g.onPremisesSecurityIdentifier; Name=$g.displayName; Location='Entra cloud'; Server=''; Protected=$false; Reason=$reason }
     }
 }
-function Options-Key { "$($source.Text.Trim())|$($target.Text.Trim())|$($server.Text.Trim())|$($tenant.Text.Trim())|$($cloud.Checked)|$($clear.Checked)|$($only.Checked)" }
+function Options-Key { "$($source.Text.Trim())|$($target.Text.Trim())|$($server.Text.Trim())|$($tenant.Text.Trim())|$($cloud.Checked)|$($clear.Checked)|$($only.Checked)|$($org.Checked)|$($employee.Checked)" }
 function Load-State {
     $dc=$server.Text.Trim()
     if (-not $dc) { throw 'Enter an AD domain or domain controller.' }
@@ -235,8 +240,12 @@ function Load-State {
         $tg+=@(Get-DirectCloud $tc)
         if ($s) { $sc=Cloud-User $s; $sg+=@(Get-DirectCloud $sc) }
     }
+    $organization=@()
+    foreach ($user in @($s,$t)) {
+        if ($user) { $organization+=([ordered]@{ Id=[string]$user.ObjectGUID; Title=$user.Title; Company=$user.Company; Department=$user.Department; Office=$user.Office; EmployeeID=$user.EmployeeID; Manager=$user.Manager } | ConvertTo-Json -Compress) }
+    }
     $fingerprint=(@($sg | ForEach-Object { "S:$($_.Key):$($_.Reason):$($_.Protected)" }) + @($tg | ForEach-Object { "T:$($_.Key):$($_.Reason):$($_.Protected)" }) | Sort-Object) -join '|'
-    [pscustomobject]@{ Source=$s; SourcePrimary=$sp; Target=$t; SourceGroups=$sg; TargetGroups=$tg; CloudTarget=$tc; DC=$dc; Options=(Options-Key); Fingerprint="$($s.ObjectGUID)|$($t.ObjectGUID)|$($t.primaryGroupID)|$fingerprint" }
+    [pscustomobject]@{ Source=$s; SourcePrimary=$sp; Target=$t; SourceGroups=$sg; TargetGroups=$tg; CloudTarget=$tc; DC=$dc; Options=(Options-Key); Fingerprint="$($s.ObjectGUID)|$($t.ObjectGUID)|$($t.primaryGroupID)|$fingerprint|$($organization -join '|')" }
 }
 function Add-Row($g,$action) {
     $reason=$g.Reason; $selected=$action -in 'Add','Remove'
@@ -246,6 +255,24 @@ function Add-Row($g,$action) {
     $row.Select=$selected; $row.Action=$action; $row.Location=$g.Location; $row.Group=$g.Name
     $row.GroupId=$g.Key; $row.Reason=$reason; $row.Result='Pending'
     $script:rows.Rows.Add($row); $script:items[$g.Key]=$g
+}
+function Add-OrganizationRows($state) {
+    if (-not $org.Checked -or $only.Checked -or -not $state.Source) { return }
+    $fields=[ordered]@{Title='Job Title'; Company='Company'; Department='Department'; Office='Office'; Manager='Manager'}
+    if ($employee.Checked) { $fields['EmployeeID']='Employee ID' }
+    foreach ($field in $fields.Keys) {
+        $before=[string]$state.Target.$field
+        $after=[string]$state.Source.$field
+        if ([string]::IsNullOrWhiteSpace($after) -or $before -ceq $after) { continue }
+        $reason=''
+        if ($field -eq 'Manager' -and $after -ieq $state.Target.DistinguishedName) { $reason='Cannot assign the target as their own manager' }
+        $item=[pscustomobject]@{Key="Org:$field"; Id=$field; Name=$fields[$field]; Location='AD organization'; Protected=$false; Reason=$reason; Value=$after}
+        Add-Row $item 'Update'
+        $row=$script:rows.Rows[$script:rows.Rows.Count-1]
+        $row.Before=$before; $row.After=$after
+        $row.Select= -not [bool]$reason
+        if ($field -eq 'EmployeeID') { $row.Reason='Optional: verify this source Employee ID is appropriate for the target' }
+    }
 }
 function Get-DisplayMemberships($groups) {
     # Match the immutable on-premises SID, never the display name: distinct
@@ -275,6 +302,7 @@ function Make-Preview($state) {
         if ($g.Reason -in @('Primary group: always preserved','Synced / previously synced: manage in AD')) { continue }
         if ($only.Checked -or $clear.Checked) { Add-Row $g 'Remove' } else { Add-Row $g 'Keep' }
     }
+    Add-OrganizationRows $state
     $displaySource=@($state.SourceGroups)
     if ($state.SourcePrimary) { $displaySource+= $state.SourcePrimary }
     $displaySource=@(Get-DisplayMemberships $displaySource)
@@ -284,16 +312,16 @@ function Make-Preview($state) {
     if ($state.Source) { $sourceBox.Text="SOURCE (read-only): $($state.Source.UserPrincipalName) - $($displaySource.Count) groups" }
     else { $sourceBox.Text='SOURCE - not used in Clear TARGET groups only mode' }
     $targetBox.Text="TARGET: $($state.Target.UserPrincipalName) - $($displayTarget.Count) groups"
-    $actionsBox.Text="Membership differences - ONLY for $($state.Target.UserPrincipalName) (shared groups hidden)"
+    $actionsBox.Text="Group differences / organizational updates - ONLY for $($state.Target.UserPrincipalName) (shared groups hidden)"
     $script:preview=$state
 }
 function Save-Table($path) {
-    @($script:rows.Rows | Select-Object Select,Action,Location,Group,GroupId,Reason,Result) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
+    @($script:rows.Rows | Select-Object Select,Action,Location,Group,Before,After,GroupId,Reason,Result) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
 }
-$previewButton=Button 'Preview groups' 15 {
+$previewButton=Button 'Preview groups / fields' 15 {
     if ($script:busy) { return }
     Busy $true
-    try { Invalidate-Preview; Note 'Reading direct AD / Entra memberships...'; Make-Preview (Load-State); Note "Preview ready: $($script:rows.Rows.Count) groups. Review selections, then run." }
+    try { Invalidate-Preview; Note 'Reading direct AD / Entra memberships...'; Make-Preview (Load-State); Note "Preview ready: $($script:rows.Rows.Count) proposed entries. Review selections, then run." }
     catch { Note $_.Exception.Message; [void][Windows.Forms.MessageBox]::Show($_.Exception.Message,'Preview failed') }
     finally { Busy $false }
 }
@@ -302,8 +330,8 @@ $applyButton=Button 'Run selected actions' 195 {
     $grid.EndEdit(); Busy $true
     try {
         if (-not $script:preview -or (Options-Key) -ne $script:preview.Options) { throw 'Inputs changed or no preview exists. Click Preview again.' }
-        $actions=@($script:rows.Rows | Where-Object { $_.Select -and $_.Action -in 'Add','Remove' })
-        if (-not $actions.Count) { throw 'Select at least one Add or Remove action.' }
+        $actions=@($script:rows.Rows | Where-Object { $_.Select -and $_.Action -in 'Add','Remove','Update' })
+        if (-not $actions.Count) { throw 'Select at least one Add, Remove or Update action.' }
         Note 'Rechecking identities and membership before running...'
         $current=Load-State
         if ($current.Source -and $current.Source.ObjectGUID -eq $current.Target.ObjectGUID) { throw 'Source and target must be different accounts.' }
@@ -311,13 +339,15 @@ $applyButton=Button 'Run selected actions' 195 {
         $mode=if ($test.Checked) { 'TEST - no changes' } else { 'LIVE - changes will be made' }
         $adds=@($actions | Where-Object Action -eq 'Add').Count
         $removes=@($actions | Where-Object Action -eq 'Remove').Count
-        $answer=[Windows.Forms.MessageBox]::Show("$mode`r`nOnly this TARGET account will be changed: $($current.Target.UserPrincipalName)`r`nAdd: $adds    Remove: $removes`r`nThe source account will NOT be modified.`r`n`r`nGroup-based licensing and resource access can change.`r`nProceed?",'Confirm selected group actions','YesNo','Warning')
+        $updates=@($actions | Where-Object Action -eq 'Update').Count
+        $answer=[Windows.Forms.MessageBox]::Show("$mode`r`nOnly this TARGET account will be changed: $($current.Target.UserPrincipalName)`r`nAdd: $adds    Remove: $removes    Organizational updates: $updates`r`nThe source account will NOT be modified.`r`n`r`nGroup-based licensing and resource access can change.`r`nProceed?",'Confirm selected target actions','YesNo','Warning')
         if ($answer -ne 'Yes') { Note 'Cancelled. No changes made.'; return }
         $root=Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'HybridGroupReports'
         $folder=Join-Path $root ((Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
         [void](New-Item -ItemType Directory -Path $folder -Force)
         @($current.TargetGroups | Select-Object Name,Location,Id,Server,Protected,Reason) | Export-Csv (Join-Path $folder 'Target-Before.csv') -NoTypeInformation -Encoding UTF8
         @($current.SourceGroups | Select-Object Name,Location,Id,Server,Protected,Reason) | Export-Csv (Join-Path $folder 'Source-Before.csv') -NoTypeInformation -Encoding UTF8
+        @($current.Source,$current.Target) | Where-Object { $_ } | Select-Object UserPrincipalName,Title,Company,Department,Office,EmployeeID,Manager | Export-Csv (Join-Path $folder 'Organization-Before.csv') -NoTypeInformation -Encoding UTF8
         $report=Join-Path $folder 'Actions.csv'
         Save-Table $report
         $failedAdd=$false; $i=0
@@ -327,6 +357,18 @@ $applyButton=Button 'Run selected actions' 195 {
             if ($test.Checked) { $row.Result='Test only - no change'; Save-Table $report; continue }
             if ($row.Action -eq 'Remove' -and $failedAdd) { $row.Result='Withheld: an addition failed'; Save-Table $report; continue }
             try {
+                if ($row.Action -eq 'Update') {
+                    $allowed=@('Title','Company','Department','Office','EmployeeID','Manager')
+                    if ($g.Id -notin $allowed) { throw 'Unsupported organizational field.' }
+                    $parameters=@{Identity=$current.Target.ObjectGUID; Server=$current.DC; ErrorAction='Stop'}
+                    $parameters[$g.Id]=$g.Value
+                    Set-ADUser @parameters
+                    $verified=Get-ADUser -Identity $current.Target.ObjectGUID -Server $current.DC -Properties $g.Id -ErrorAction Stop
+                    if ([string]$verified.($g.Id) -cne [string]$g.Value) { throw 'Organizational write returned but verification did not match.' }
+                    $row.Result='Succeeded and verified in AD'
+                    Save-Table $report
+                    continue
+                }
                 if ($g.Location -eq 'Windows AD') {
                     if ($row.Action -eq 'Add') { Add-ADGroupMember -Identity $g.Id -Members $current.Target.DistinguishedName -Server $g.Server -ErrorAction Stop }
                     else { Remove-ADGroupMember -Identity $g.Id -Members $current.Target.DistinguishedName -Server $g.Server -Confirm:$false -ErrorAction Stop }
@@ -352,7 +394,10 @@ $applyButton=Button 'Run selected actions' 195 {
             }
             Save-Table $report
         }
-        if (-not $test.Checked) { $script:preview=$null }
+        if (-not $test.Checked) {
+            $script:preview=$null
+            Get-ADUser -Identity $current.Target.ObjectGUID -Server $current.DC -Properties Title,Company,Department,Office,EmployeeID,Manager | Select-Object UserPrincipalName,Title,Company,Department,Office,EmployeeID,Manager | Export-Csv (Join-Path $folder 'Organization-After.csv') -NoTypeInformation -Encoding UTF8
+        }
         Note "Finished. CSV reports: $folder. AD changes appear in Entra after normal synchronization."
         [void][Windows.Forms.MessageBox]::Show("Finished. Review Actions.csv for successes, skips or failures.`r`nReports: $folder",'Group processing complete')
     } catch { Note $_.Exception.Message; [void][Windows.Forms.MessageBox]::Show($_.Exception.Message,'Operation stopped') }
@@ -370,12 +415,13 @@ $exportButton=Button 'Export displayed CSV' 375 {
     $dialog.Dispose()
 }
 $selectButton=Button 'Select eligible actions' 555 {
-    foreach ($r in $script:rows.Rows) { $g=$script:items[$r.GroupId]; $r.Select=($r.Action -in 'Add','Remove' -and -not $g.Protected -and -not $g.Reason) }
+    foreach ($r in $script:rows.Rows) { $g=$script:items[$r.GroupId]; $r.Select=($r.Action -in 'Add','Remove','Update' -and -not $g.Protected -and -not $g.Reason) }
 }
 $noneButton=Button 'Uncheck all' 735 { foreach ($r in $script:rows.Rows) { $r.Select=$false } }
-$only.Add_CheckedChanged({ $source.Enabled= -not $only.Checked; $clear.Enabled= -not $only.Checked; Invalidate-Preview })
+$only.Add_CheckedChanged({ $org.Enabled= -not $only.Checked; $employee.Enabled=($org.Checked -and -not $only.Checked); $source.Enabled= -not $only.Checked; $clear.Enabled= -not $only.Checked; Invalidate-Preview })
 foreach ($inputBox in @($source,$target,$server,$tenant)) { $inputBox.Add_TextChanged({ Invalidate-Preview }) }
-foreach ($option in @($cloud,$clear)) { $option.Add_CheckedChanged({ Invalidate-Preview }) }
+$org.Add_CheckedChanged({ $employee.Enabled=($org.Checked -and -not $only.Checked); Invalidate-Preview })
+foreach ($option in @($cloud,$clear,$employee)) { $option.Add_CheckedChanged({ Invalidate-Preview }) }
 $form.Add_FormClosing({ param($sender,$e) if ($script:busy) { $e.Cancel=$true } })
 [void]$form.ShowDialog()
 $form.Dispose()

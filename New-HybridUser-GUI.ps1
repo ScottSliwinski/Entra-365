@@ -18,6 +18,7 @@ Import-Module ActiveDirectory
 $script:created = $null
 $script:reportSaved = $false
 $script:mimic = 'N/A'
+$script:copyIdentity = ''
 $script:defaultGroups = @{
     'awmi.net' = @('365 AWM Licensing (AWMI)','All AWM Staff','All Colorado Staff','All HQ Staff','All Charis WP Staff')
     'awmcharis.com' = @('365 AWM Licensing (AWMCharis)','All Charis Staff','All Colorado Staff','All Charis WP Staff')
@@ -59,7 +60,7 @@ function Generate-Password {
     $script:controls.Password.Text = $p
 }
 $f = New-Object Windows.Forms.Form
-$f.Text = 'AWM - Hybrid Account Creation v6'
+$f.Text = 'AWM - Hybrid Account Creation v7'
 $f.Size = New-Object Drawing.Size(1000,900)
 $f.MinimumSize = New-Object Drawing.Size(850,650)
 $f.StartPosition = 'CenterScreen'
@@ -107,7 +108,7 @@ Field Show 'Show password' Check
 $script:controls.Show.Add_CheckedChanged({$script:controls.Password.UseSystemPasswordChar=-not $script:controls.Show.Checked})
 Field Change 'Change password at next logon' Check
 $script:controls.Change.Checked=$true
-foreach ($item in @(@('Description','Description'),@('Office','Office'),@('Email','Email / primary SMTP'),@('Title','Job title'),@('Department','Department'),@('Company','Company'),@('Manager','Manager UPN or sAMAccountName (optional)'),@('Proxy','proxyAddresses (one per line)'))) { Field $item[0] $item[1] }
+foreach ($item in @(@('Description','Description'),@('Office','Office'),@('Email','Email / primary SMTP'),@('Title','Job title'),@('Department','Department'),@('Company','Company'),@('Manager','Manager UPN / logon / DN (optional)'),@('Proxy','proxyAddresses (one per line)'))) { Field $item[0] $item[1] }
 # Normalize typed and pasted email text to lowercase before SMTP synchronization.
 $script:controls.Email.CharacterCasing=[Windows.Forms.CharacterCasing]::Lower
 $script:controls.Proxy.Multiline=$true; $script:controls.Proxy.Height=75; $script:controls.Proxy.Parent.Height=83
@@ -229,7 +230,22 @@ $script:controls.NoGroups.Add_CheckedChanged({
 })
 $generate.Add_Click({Generate-Password})
 function Escape-Ldap([string]$s) { $s.Replace('\','\5c').Replace('*','\2a').Replace('(','\28').Replace(')','\29').Replace([string][char]0,'\00') }
+function Server-ForDN([string]$dn) {
+    $owners=@($forest.Domains | Where-Object {
+        $base=(@($_ -split '\.' | ForEach-Object {'DC='+$_}) -join ',')
+        $dn.EndsWith(','+$base,[StringComparison]::OrdinalIgnoreCase)
+    } | Sort-Object Length -Descending)
+    if ($owners.Count -eq 0) {throw "Cannot locate the forest domain for $dn"}
+    return [string]$owners[0]
+}
 function Resolve-Group([string]$identity) {
+    if ($identity -match '^(?i)CN=') {
+        $server=Server-ForDN $identity
+        $g=Get-ADGroup -Identity $identity -Server $server -ErrorAction Stop
+        $script:groupServers[$g.DistinguishedName]=$server
+        return $g
+    }
+
     $found=@(foreach ($d in $forest.Domains) {
         Get-ADGroup -LDAPFilter "(|(distinguishedName=$(Escape-Ldap $identity))(sAMAccountName=$(Escape-Ldap $identity))(name=$(Escape-Ldap $identity)))" -Server $d | ForEach-Object {
             $script:groupServers[$_.DistinguishedName]=[string]$d
@@ -241,6 +257,7 @@ function Resolve-Group([string]$identity) {
 }
 $copy.Add_Click({
     try {
+        $script:copyIdentity=''
         $identity=$script:controls.Mimic.Text.Trim()
         if (-not $identity) { throw 'Enter the source user UPN or logon name.' }
         $matches=@(foreach ($d in $forest.Domains) {
@@ -253,24 +270,23 @@ $copy.Add_Click({
             # memberOf gives direct memberships; nested memberships and primary group are not copied.
             foreach ($dn in @($source.memberOf)) { $g=Resolve-Group ([string]$dn); $toCopy += [string]$g.DistinguishedName }
         }
-        $summary="Copy from $($source.UserPrincipalName)?`r`nWork attributes: $($script:controls.CopyAttributes.Checked)`r`nDirect groups: $($toCopy.Count)`r`n`r`n$($toCopy -join "`r`n")`r`n`r`nReview the resulting fields and group list before creating the account."
+        $managerIdentity=''
+        if ($script:controls.CopyAttributes.Checked -and $source.Manager) {
+            $managerServer=Server-ForDN ([string]$source.Manager)
+            $managerObject=Get-ADUser -Identity $source.Manager -Server $managerServer -ErrorAction Stop
+            $managerIdentity=[string]$managerObject.DistinguishedName
+        }
+        $summary="Copy from $($source.UserPrincipalName)?`r`nWork attributes: $($script:controls.CopyAttributes.Checked)`r`nDirect groups: $($toCopy.Count)`r`n`r`n$($toCopy -join "`r`n")`r`n`r`nManager: $managerIdentity`r`nDepartment: $($source.Department)`r`nJob title: $($source.Title)`r`nEntra administrator roles are not copied.`r`nReview the resulting fields and group list before creating the account."
         if ([Windows.Forms.MessageBox]::Show($summary,'Review source account','YesNo','Question') -ne 'Yes') { return }
         if ($script:controls.CopyAttributes.Checked) {
             foreach ($key in @('Description','Office','Title','Department','Company')) { $script:controls[$key].Text=[string]$source.$key }
-            $managerUPN=''
-            if ($source.Manager) {
-                foreach ($d in $forest.Domains) {
-                    $m=Get-ADUser -LDAPFilter "(distinguishedName=$(Escape-Ldap ([string]$source.Manager)))" -Server $d
-                    if ($m) { $managerUPN=$m.UserPrincipalName; break }
-                }
-                if (-not $managerUPN) { throw 'Source manager could not be resolved.' }
-            }
-            $script:controls.Manager.Text=[string]$managerUPN
+            $script:controls.Manager.Text=$managerIdentity
         }
         if ($script:controls.CopyGroups.Checked -and -not $script:controls.NoGroups.Checked) {
             $combined=@($script:controls.Groups.Lines | Where-Object { $_.Trim() }) + $toCopy
             $script:controls.Groups.Lines=[string[]]@($combined | Select-Object -Unique)
         }
+        $script:copyIdentity=$identity
         $script:mimic=[string]$source.UserPrincipalName
         if (-not $script:mimic) { $script:mimic=[string]$source.SamAccountName }
         Log "Copied from $script:mimic. Review groups (including privileged groups) and attributes."
@@ -279,6 +295,9 @@ $copy.Add_Click({
 $create.Add_Click({
     $create.Enabled=$false
     try {
+        if ($script:controls.Mimic.Text.Trim() -and $script:controls.Mimic.Text.Trim() -ine $script:copyIdentity) {
+            throw 'Click Load / Copy user and confirm a successful copy before creating this account. Clear Copy from user to create without copying.'
+        }
         foreach ($k in @('First','Last','Full','Logon','Email','Password')) { if ([string]::IsNullOrWhiteSpace($script:controls[$k].Text)) {throw "$k is required."} }
         if (-not $script:controls.OU.SelectedItem) { throw 'Select the destination OU using the dropdown or Browse / Refresh OUs.' }
         if (-not $script:controls.Suffix.SelectedItem) { throw 'Select a user logon domain.' }
@@ -308,14 +327,18 @@ $create.Add_Click({
         $manager=$null
         if ($script:controls.Manager.Text.Trim()) {
             $m=$script:controls.Manager.Text.Trim()
-            $matches=@(foreach ($d in $forest.Domains) {Get-ADUser -LDAPFilter "(|(userPrincipalName=$(Escape-Ldap $m))(sAMAccountName=$(Escape-Ldap $m)))" -Server $d})
+            if ($m -match '^(?i)CN=') {
+                $matches=@(Get-ADUser -Identity $m -Server (Server-ForDN $m) -ErrorAction Stop)
+            } else {
+                $matches=@(foreach ($d in $forest.Domains) {Get-ADUser -LDAPFilter "(|(userPrincipalName=$(Escape-Ldap $m))(sAMAccountName=$(Escape-Ldap $m)))" -Server $d})
+            }
             if ($matches.Count -ne 1) {throw 'Manager must resolve to exactly one AD user. Use their UPN.'}
             $manager=$matches[0].DistinguishedName
         }
         if ($script:controls.NoGroups.Checked -and [string]$script:controls.Suffix.SelectedItem -ine 'awmcharis.com') { throw 'Intern / World Outreach accounts must use the AWMCharis.com UPN suffix.' }
         $groups=@()
         if (-not $script:controls.NoGroups.Checked) {
-        $groups=@(foreach ($g in ($script:controls.Groups.Text -split '[;\r\n]+' | ForEach-Object {$_.Trim()} | Where-Object {$_} | Select-Object -Unique)) {Resolve-Group $g})
+        $groups=@(foreach ($g in ($script:controls.Groups.Text -split '[\r\n]+' | ForEach-Object {$_.Trim()} | Where-Object {$_} | Select-Object -Unique)) {Resolve-Group $g})
         $groups=@($groups | Sort-Object DistinguishedName -Unique)
         }
         $argsAD=@{Name=$script:controls.Full.Text.Trim(); DisplayName=$script:controls.Full.Text.Trim(); GivenName=$script:controls.First.Text.Trim(); Surname=$script:controls.Last.Text.Trim(); SamAccountName=$sam; UserPrincipalName=$upn; Path=$script:controls.OU.SelectedItem.ToString(); Server=$script:dc; AccountPassword=(ConvertTo-SecureString $p -AsPlainText -Force); Enabled=$false; ChangePasswordAtLogon=$script:controls.Change.Checked; OtherAttributes=@{proxyAddresses=[string[]]$proxies}; EmailAddress=$mail; PassThru=$true}
@@ -333,7 +356,19 @@ $create.Add_Click({
         Log "AD object created: $upn"
         # Defense in depth: never assign optional groups for Intern / World Outreach.
         if ($script:created.NoGroups) { $groups=@() }
-        foreach ($g in $groups) {try {Add-ADGroupMember -Identity $g.DistinguishedName -Members $u -Server $script:groupServers[$g.DistinguishedName]; Log "Added group: $($g.Name)"} catch {$script:issues.Add("Group $($g.Name): $($_.Exception.Message)"); Log $script:issues[$script:issues.Count-1]}}
+        foreach ($g in $groups) {try {Add-ADGroupMember -Identity $g.DistinguishedName -Members $u.DistinguishedName -Server $script:groupServers[$g.DistinguishedName] -ErrorAction Stop
+            $checkGroup=Get-ADGroup -Identity $g.DistinguishedName -Server $script:groupServers[$g.DistinguishedName] -Properties member -ErrorAction Stop
+            if (@($checkGroup.member) -notcontains $u.DistinguishedName) {throw 'Membership was not confirmed by readback.'}
+            Log "Added group: $($g.Name)"} catch {$script:issues.Add("Group $($g.Name): $($_.Exception.Message)"); Log $script:issues[$script:issues.Count-1]}}
+        $saved=Get-ADUser -Identity $u.ObjectGUID -Server $script:dc -Properties Description,Office,Title,Department,Company,Manager
+        foreach ($attribute in @('Description','Office','Title','Department','Company','Manager')) {
+            if ($argsAD.ContainsKey($attribute) -and [string]$saved.$attribute -ine [string]$argsAD[$attribute]) {
+                $script:issues.Add("Attribute $attribute did not match the requested value after creation.")
+            }
+        }
+        if ($script:issues.Count -gt 0) {
+            [void][Windows.Forms.MessageBox]::Show(($script:issues -join "`r`n"),'Account created with incomplete operations','OK','Warning')
+        }
         Enable-ADAccount -Identity $u.ObjectGUID -Server $script:dc
         Log 'AD account enabled. Attributes saved. Check sync / Enable MFA is now available. This tool does not wait automatically: allow directory synchronization, then click the button; retry if the cloud account is not yet available.'
         if (-not $script:created.MFARequested) {$script:mfa='Not requested / not verified'}
@@ -441,6 +476,7 @@ $another.Add_Click({
     $script:reportSaved=$false
     $script:mfa='Pending - not yet enabled'
     $script:mimic='N/A'
+    $script:copyIdentity=''
     $script:issues.Clear()
     $script:groupServers.Clear()
     foreach ($c in $script:controls.Values) {$c.Enabled=$true}
