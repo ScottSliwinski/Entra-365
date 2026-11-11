@@ -17,8 +17,11 @@ Import-Module ActiveDirectory
 [Windows.Forms.Application]::EnableVisualStyles()
 $script:created = $null
 $script:reportSaved = $false
+$script:exportWaiting = $false
 $script:mimic = 'N/A'
 $script:copyIdentity = ''
+$script:cloudCopyPlan=@()
+$script:cloudCopyResults=@()
 $script:defaultGroups = @{
     'awmi.net' = @('365 AWM Licensing (AWMI)','All AWM Staff','All Colorado Staff','All HQ Staff','All Charis WP Staff')
     'awmcharis.com' = @('365 AWM Licensing (AWMCharis)','All Charis Staff','All Colorado Staff','All Charis WP Staff')
@@ -60,7 +63,7 @@ function Generate-Password {
     $script:controls.Password.Text = $p
 }
 $f = New-Object Windows.Forms.Form
-$f.Text = 'AWM - Hybrid Account Creation v7'
+$f.Text = 'AWM - Hybrid Account Creation v11'
 $f.Size = New-Object Drawing.Size(1000,900)
 $f.MinimumSize = New-Object Drawing.Size(850,650)
 $f.StartPosition = 'CenterScreen'
@@ -71,6 +74,10 @@ function Field([string]$key,[string]$label,[string]$kind='Text') {
     $row=New-Object Windows.Forms.Panel; $row.Size=New-Object Drawing.Size(940,34)
     $l=New-Object Windows.Forms.Label; $l.Text=$label; $l.Location=New-Object Drawing.Point(8,8); $l.Size=New-Object Drawing.Size(275,22)
     if ($kind -eq 'Combo') { $c=New-Object Windows.Forms.ComboBox; $c.DropDownStyle='DropDownList' }
+    elseif ($kind -eq 'EditableCombo') {
+        $c=New-Object Windows.Forms.ComboBox; $c.DropDownStyle='DropDown'
+        $c.AutoCompleteMode='SuggestAppend'; $c.AutoCompleteSource='ListItems'
+    }
     elseif ($kind -eq 'Check') { $c=New-Object Windows.Forms.CheckBox }
     else { $c=New-Object Windows.Forms.TextBox }
     $c.Location=New-Object Drawing.Point(285,4); $c.Size=New-Object Drawing.Size(630,26)
@@ -92,9 +99,16 @@ $browseOU.Text='Browse / Refresh OUs'
 $browseOU.Location=New-Object Drawing.Point(765,3)
 $browseOU.Size=New-Object Drawing.Size(150,28)
 $script:controls.OU.Parent.Controls.Add($browseOU)
-Field Mimic 'Copy from user (UPN or logon name)'
+Field Mimic 'Copy from user (name, UPN or logon)'
+$script:controls.Mimic.Width=470
+$sourceSearch=New-Object Windows.Forms.Button
+$sourceSearch.Text='Search users'
+$sourceSearch.SetBounds(765,3,150,28)
+$script:controls.Mimic.Parent.Controls.Add($sourceSearch)
 Field CopyAttributes 'Copy work attributes / manager' Check
 $script:controls.CopyAttributes.Checked=$true
+Field CopyCloud 'Copy cloud group memberships after sync' Check
+$script:controls.CopyCloud.Checked=$true
 Field CopyGroups 'Copy direct AD groups (merge defaults)' Check
 $script:controls.CopyGroups.Checked=$true
 
@@ -108,7 +122,26 @@ Field Show 'Show password' Check
 $script:controls.Show.Add_CheckedChanged({$script:controls.Password.UseSystemPasswordChar=-not $script:controls.Show.Checked})
 Field Change 'Change password at next logon' Check
 $script:controls.Change.Checked=$true
-foreach ($item in @(@('Description','Description'),@('Office','Office'),@('Email','Email / primary SMTP'),@('Title','Job title'),@('Department','Department'),@('Company','Company'),@('Manager','Manager UPN / logon / DN (optional)'),@('Proxy','proxyAddresses (one per line)'))) { Field $item[0] $item[1] }
+Field Description 'Description'
+Field Office 'Work location / Office' EditableCombo
+[void]$script:controls.Office.Items.AddRange([object[]]@('AWM HQ','WFH/Remote','Charis Bible College - Woodland Park'))
+Field Email 'Email / primary SMTP'
+Field Title 'Job title'
+Field Department 'Department (type to search)' EditableCombo
+$script:controls.Department.Width=470
+$departmentSearch=New-Object Windows.Forms.Button
+$departmentSearch.Text='Load departments'
+$departmentSearch.SetBounds(765,3,150,28)
+$script:controls.Department.Parent.Controls.Add($departmentSearch)
+Field Company 'Company' EditableCombo
+[void]$script:controls.Company.Items.AddRange([object[]]@('Andrew Wommack Ministries','Charis Bible College - Woodland Park'))
+Field Manager 'Manager (name, UPN or logon)'
+$script:controls.Manager.Width=470
+$managerSearch=New-Object Windows.Forms.Button
+$managerSearch.Text='Search managers'
+$managerSearch.SetBounds(765,3,150,28)
+$script:controls.Manager.Parent.Controls.Add($managerSearch)
+Field Proxy 'proxyAddresses (one per line)'
 # Normalize typed and pasted email text to lowercase before SMTP synchronization.
 $script:controls.Email.CharacterCasing=[Windows.Forms.CharacterCasing]::Lower
 $script:controls.Proxy.Multiline=$true; $script:controls.Proxy.Height=75; $script:controls.Proxy.Parent.Height=83
@@ -216,11 +249,14 @@ $script:controls.NoGroups.Add_CheckedChanged({
         $script:controls.Groups.Enabled=$false
         $script:controls.CopyGroups.Checked=$false
         $script:controls.CopyGroups.Enabled=$false
+        $script:controls.CopyCloud.Enabled=$false
+        $script:controls.CopyCloud.Checked=$false
         Log 'Intern / World Outreach selected: AWMCharis.com UPN; no optional AD groups will be assigned.'
     } else {
         $script:controls.Suffix.Enabled=$true
         $script:controls.Groups.Enabled=$true
         $script:controls.CopyGroups.Enabled=$true
+        $script:controls.CopyCloud.Enabled=$true
         $script:controls.CopyGroups.Checked=$script:copyGroupsBeforeNoGroups
         # Resume the standard defaults for the current UPN suffix.
         $script:controls.Groups.Lines=[string[]]@($script:groupsBeforeNoGroups | Where-Object { $_ -notin $script:defaultGroups['awmi.net'] -and $_ -notin $script:defaultGroups['awmcharis.com'] })
@@ -255,16 +291,171 @@ function Resolve-Group([string]$identity) {
     if ($found.Count -ne 1) { throw "Group '$identity' resolved to $($found.Count) matches. Use its exact distinguished name if ambiguous." }
     return $found[0]
 }
+function Connect-CopyGraph([string[]]$scopes) {
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    $tenant=[guid]::Empty
+    if (-not [guid]::TryParse($script:controls.Tenant.Text.Trim(),[ref]$tenant)) {throw 'Enter the Entra tenant ID before loading cloud memberships.'}
+    $ctx=Get-MgContext
+    if (-not $ctx -or $ctx.TenantId -ne $tenant.ToString() -or @($scopes | Where-Object {$_ -notin $ctx.Scopes}).Count -gt 0) {
+        if ($ctx) {Disconnect-MgGraph | Out-Null}
+        Connect-MgGraph -TenantId $tenant.ToString() -Scopes $scopes -ContextScope Process -NoWelcome
+    }
+    if ((Get-MgContext).TenantId -ne $tenant.ToString()) {throw 'Graph tenant mismatch.'}
+}
+function Cloud-GroupSkipReason($g) {
+    if ($g.onPremisesSyncEnabled -or $g.onPremisesSecurityIdentifier) {return 'Manage in on-prem AD'}
+    if (@($g.groupTypes) -contains 'DynamicMembership') {return 'Dynamic membership: managed by rules'}
+    if ($g.isAssignableToRole) {return 'Role-assignable group: not copied'}
+    if ($g.mailEnabled -and @($g.groupTypes) -notcontains 'Unified') {return 'Distribution / mail-enabled security: requires Exchange'}
+    if (-not $g.securityEnabled -and @($g.groupTypes) -notcontains 'Unified') {return 'Unsupported group type'}
+    return ''
+}
+function Read-CloudCopyPlan($source) {
+    Connect-CopyGraph @('User.Read.All','Group.Read.All')
+    $id=[uri]::EscapeDataString($source.UserPrincipalName)
+    $user=Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/${id}?`$select=id,onPremisesSecurityIdentifier"
+    if ($user.onPremisesSecurityIdentifier -ne $source.SID.Value) {throw 'Source Entra identity does not match the source AD SID.'}
+    $uri="https://graph.microsoft.com/v1.0/users/$($user.id)/memberOf?`$select=id,displayName&`$top=999"
+    do {
+        $page=Invoke-MgGraphRequest -Method GET -Uri $uri
+        foreach ($item in @($page.value)) {
+            if ($item.'@odata.type' -ne '#microsoft.graph.group') {continue}
+            $g=Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$($item.id)?`$select=id,displayName,groupTypes,mailEnabled,securityEnabled,isAssignableToRole,onPremisesSyncEnabled,onPremisesSecurityIdentifier"
+            $reason=Cloud-GroupSkipReason $g
+            [pscustomobject]@{Id=[string]$g.id; Name=[string]$g.displayName; Reason=$reason; Tenant=(Get-MgContext).TenantId}
+        }
+        $uri=[string]$page.'@odata.nextLink'
+    } while ($uri)
+}
+function Apply-CloudCopy($cloud) {
+    if ($script:created.NoGroups -or @($script:created.CloudPlan).Count -eq 0) {return}
+    Connect-CopyGraph @('User.Read.All','Group.Read.All','GroupMember.ReadWrite.All','GroupMember.Read.All','Policy.ReadWrite.AuthenticationMethod')
+    foreach ($entry in @($script:created.CloudPlan)) {
+        if ($entry.Reason) {continue}
+        try {
+            if ($entry.Tenant -ne (Get-MgContext).TenantId) {throw 'Copy plan tenant mismatch.'}
+            $g=Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$($entry.Id)?`$select=id,groupTypes,mailEnabled,securityEnabled,isAssignableToRole,onPremisesSyncEnabled,onPremisesSecurityIdentifier"
+            $reason=Cloud-GroupSkipReason $g
+            if ($reason) {throw $reason}
+            # Check existing direct membership; retries never remove or duplicate membership.
+            $uri="https://graph.microsoft.com/v1.0/users/$($cloud.id)/memberOf?`$select=id&`$top=999"
+            $present=$false
+            do {
+                $page=Invoke-MgGraphRequest -Method GET -Uri $uri
+                if (@($page.value | Where-Object {$_.id -eq $entry.Id}).Count -gt 0) {$present=$true}
+                $uri=[string]$page.'@odata.nextLink'
+            } while ($uri -and -not $present)
+            if (-not $present) {
+                $body=@{'@odata.id'="https://graph.microsoft.com/v1.0/directoryObjects/$($cloud.id)"} | ConvertTo-Json
+                Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/$($entry.Id)/members/`$ref" -Body $body -ContentType 'application/json' | Out-Null
+            }
+            $result=if ($present) {'Already a member'} else {'Added (Graph accepted)'}
+            $script:cloudCopyResults+= "$($entry.Name): $result"
+            Log "Cloud group $($entry.Name): $result"
+        } catch {
+            $script:cloudCopyResults+="FAILED $($entry.Name): $($_.Exception.Message)"
+            Log $script:cloudCopyResults[-1]
+        }
+    }
+}
+function Find-CopySource([string]$query,[bool]$alwaysChoose=$false,[string]$pickerTitle='Choose the user to copy') {
+    if ([string]::IsNullOrWhiteSpace($query)) {throw 'Enter a name, part of a name, UPN or logon name to search.'}
+    $properties=@('Description','Office','Title','Department','Company','Manager','memberOf')
+    $escaped=Escape-Ldap $query.Trim()
+    $exact=@(foreach ($d in $forest.Domains) {
+        Get-ADUser -LDAPFilter "(|(userPrincipalName=$escaped)(sAMAccountName=$escaped)(distinguishedName=$escaped))" -Server $d -Properties $properties -ErrorAction Stop
+    })
+    $exact=@($exact | Sort-Object ObjectGUID -Unique)
+    if ($exact.Count -eq 1 -and -not $alwaysChoose) {return $exact[0]}
+    $candidates=$exact
+    if ($candidates.Count -eq 0) {
+        if ($query.Trim().Length -lt 2) {throw 'Enter at least two characters for a name search.'}
+        $candidates=@(foreach ($d in $forest.Domains) {
+            Get-ADUser -LDAPFilter "(|(displayName=*$escaped*)(givenName=*$escaped*)(sn=*$escaped*)(sAMAccountName=*$escaped*)(userPrincipalName=*$escaped*))" -Server $d -Properties $properties -ResultSetSize 201 -ErrorAction Stop
+        })
+        $candidates=@($candidates | Sort-Object ObjectGUID -Unique)
+    }
+    if ($candidates.Count -eq 0) {throw 'No AD users matched. Try a shorter name or the UPN.'}
+    if ($candidates.Count -gt 200) {throw 'More than 200 users matched. Enter more of the name or a UPN to narrow the search.'}
+    $candidates=@($candidates | Sort-Object DisplayName,UserPrincipalName)
+    $picker=New-Object Windows.Forms.Form
+    $picker.Text=$pickerTitle
+    $picker.Size=New-Object Drawing.Size(1050,500)
+    $picker.StartPosition='CenterParent'
+    $help=New-Object Windows.Forms.Label
+    $help.Text='Select the account. Each row shows name | UPN | department | enabled status | AD path.'
+    $help.Dock='Top'; $help.Height=35
+    $list=New-Object Windows.Forms.ListBox
+    $list.Dock='Fill'; $list.HorizontalScrollbar=$true
+    foreach ($u in $candidates) {
+        [void]$list.Items.Add("$($u.DisplayName) | $($u.UserPrincipalName) | $($u.Department) | Enabled: $($u.Enabled) | $($u.DistinguishedName)")
+    }
+    $choose=New-Object Windows.Forms.Button
+    $choose.Text='Use selected user'; $choose.Dock='Bottom'; $choose.Height=36
+    $choose.Add_Click({if ($list.SelectedIndex -ge 0) {$picker.DialogResult='OK'; $picker.Close()}})
+    $list.Add_DoubleClick({if ($list.SelectedIndex -ge 0) {$picker.DialogResult='OK'; $picker.Close()}})
+    $picker.Controls.Add($list); $picker.Controls.Add($help); $picker.Controls.Add($choose)
+    try {
+        if ($picker.ShowDialog($f) -ne 'OK') {return $null}
+        return $candidates[$list.SelectedIndex]
+    } finally {$picker.Dispose()}
+}
+$managerSearch.Add_Click({
+    try {
+        $managerSearch.Enabled=$false
+        $chosen=Find-CopySource $script:controls.Manager.Text.Trim() $true 'Choose manager'
+        if ($chosen) {
+            # Use the exact AD path so duplicate display names cannot select the wrong manager.
+            $script:controls.Manager.Text=[string]$chosen.DistinguishedName
+            Log "Selected manager: $($chosen.DisplayName) ($($chosen.UserPrincipalName))."
+        }
+    } catch {[void][Windows.Forms.MessageBox]::Show($_.Exception.Message,'Manager search')}
+    finally {$managerSearch.Enabled=($null -eq $script:created)}
+})
+$departmentSearch.Add_Click({
+    try {
+        $departmentSearch.Enabled=$false
+        $old=$script:controls.Department.Text
+        Log 'Loading department names from AD forest domains...'
+        $departments=@(foreach ($d in $forest.Domains) {
+            Get-ADUser -LDAPFilter '(department=*)' -Server $d -Properties Department -ErrorAction Stop | ForEach-Object {$_.Department}
+        })
+        $departments=@($departments | Where-Object {-not [string]::IsNullOrWhiteSpace($_)} | Sort-Object -Unique)
+        $script:controls.Department.BeginUpdate()
+        try {
+            $script:controls.Department.Items.Clear()
+            if ($departments.Count -gt 0) {$script:controls.Department.Items.AddRange([object[]]$departments)}
+            $script:controls.Department.Text=$old
+        } finally {$script:controls.Department.EndUpdate()}
+        Log "Loaded $($departments.Count) departments. Type in Department to search or use its dropdown."
+        $script:controls.Department.DroppedDown=$true
+    } catch {[void][Windows.Forms.MessageBox]::Show($_.Exception.Message,'Department search')}
+    finally {$departmentSearch.Enabled=($null -eq $script:created)}
+})
+$sourceSearch.Add_Click({
+    try {
+        $sourceSearch.Enabled=$false
+        $chosen=Find-CopySource $script:controls.Mimic.Text.Trim() $true
+        if ($chosen) {
+            $script:controls.Mimic.Text=[string]$chosen.DistinguishedName
+            $script:copyIdentity=''
+            Log "Selected source: $($chosen.DisplayName) ($($chosen.UserPrincipalName)). Click Load / Copy user to preview and copy."
+        }
+    } catch {[void][Windows.Forms.MessageBox]::Show($_.Exception.Message,'Source user search')}
+    finally {$sourceSearch.Enabled=($null -eq $script:created)}
+})
 $copy.Add_Click({
     try {
         $script:copyIdentity=''
+    $script:cloudCopyPlan=@()
+    $script:cloudCopyResults=@()
+        $script:cloudCopyPlan=@()
         $identity=$script:controls.Mimic.Text.Trim()
-        if (-not $identity) { throw 'Enter the source user UPN or logon name.' }
-        $matches=@(foreach ($d in $forest.Domains) {
-            Get-ADUser -LDAPFilter "(|(userPrincipalName=$(Escape-Ldap $identity))(sAMAccountName=$(Escape-Ldap $identity)))" -Server $d -Properties Description,Office,Title,Department,Company,Manager,memberOf
-        })
-        if ($matches.Count -ne 1) { throw 'Source user must resolve to exactly one AD user. Use the UPN.' }
-        $source=$matches[0]
+        $source=Find-CopySource $identity
+        if (-not $source) {return}
+        # Keep the exact selected AD identity even when names or UPNs overlap.
+        $identity=[string]$source.DistinguishedName
+        $script:controls.Mimic.Text=$identity
         $toCopy=@()
         if ($script:controls.CopyGroups.Checked -and -not $script:controls.NoGroups.Checked) {
             # memberOf gives direct memberships; nested memberships and primary group are not copied.
@@ -276,7 +467,10 @@ $copy.Add_Click({
             $managerObject=Get-ADUser -Identity $source.Manager -Server $managerServer -ErrorAction Stop
             $managerIdentity=[string]$managerObject.DistinguishedName
         }
-        $summary="Copy from $($source.UserPrincipalName)?`r`nWork attributes: $($script:controls.CopyAttributes.Checked)`r`nDirect groups: $($toCopy.Count)`r`n`r`n$($toCopy -join "`r`n")`r`n`r`nManager: $managerIdentity`r`nDepartment: $($source.Department)`r`nJob title: $($source.Title)`r`nEntra administrator roles are not copied.`r`nReview the resulting fields and group list before creating the account."
+        $cloudPlan=@()
+        if ($script:controls.CopyCloud.Checked -and -not $script:controls.NoGroups.Checked) {$cloudPlan=@(Read-CloudCopyPlan $source)}
+        $cloudPreview=@($cloudPlan | ForEach-Object {if ($_.Reason) {"SKIP: $($_.Name) - $($_.Reason)"} else {"COPY: $($_.Name)"}}) -join "`r`n"
+        $summary="Copy from $($source.UserPrincipalName)?`r`nWork attributes: $($script:controls.CopyAttributes.Checked)`r`nDirect groups: $($toCopy.Count)`r`n`r`n$($toCopy -join "`r`n")`r`n`r`nManager: $managerIdentity`r`nDepartment: $($source.Department)`r`nJob title: $($source.Title)`r`nCloud memberships (direct):`r`n$cloudPreview`r`nEntra administrator roles are not copied.`r`nReview the resulting fields and group list before creating the account."
         if ([Windows.Forms.MessageBox]::Show($summary,'Review source account','YesNo','Question') -ne 'Yes') { return }
         if ($script:controls.CopyAttributes.Checked) {
             foreach ($key in @('Description','Office','Title','Department','Company')) { $script:controls[$key].Text=[string]$source.$key }
@@ -286,6 +480,7 @@ $copy.Add_Click({
             $combined=@($script:controls.Groups.Lines | Where-Object { $_.Trim() }) + $toCopy
             $script:controls.Groups.Lines=[string[]]@($combined | Select-Object -Unique)
         }
+        $script:cloudCopyPlan=$cloudPlan
         $script:copyIdentity=$identity
         $script:mimic=[string]$source.UserPrincipalName
         if (-not $script:mimic) { $script:mimic=[string]$source.SamAccountName }
@@ -348,9 +543,13 @@ $create.Add_Click({
         if ($answer -ne 'Yes') {return}
         # Create disabled first. A failure during enablement is retained and reported.
         $u=New-ADUser @argsAD
-        $script:created=@{Guid=$u.ObjectGUID; SID=$u.SID.Value; UPN=$upn; Sam=$sam; Password=$p; DC=$script:dc; Tenant=$script:controls.Tenant.Text.Trim(); Change=$script:controls.Change.Checked; MFARequested=$script:controls.MFA.Checked; License=$script:controls.License.Text; Notes=$script:controls.Notes.Text; Mimic=$script:mimic; NoGroups=$script:controls.NoGroups.Checked}
+        $script:created=@{Guid=$u.ObjectGUID; SID=$u.SID.Value; UPN=$upn; Sam=$sam; Password=$p; DC=$script:dc; Tenant=$script:controls.Tenant.Text.Trim(); Change=$script:controls.Change.Checked; MFARequested=$script:controls.MFA.Checked; License=$script:controls.License.Text; Notes=$script:controls.Notes.Text; Mimic=$script:mimic; NoGroups=$script:controls.NoGroups.Checked; CloudPlan=@(); CloudSkipped=@()}
+        if ($script:controls.CopyCloud.Checked -and -not $script:created.NoGroups) {
+            $script:created.CloudPlan=@($script:cloudCopyPlan)
+            $script:created.CloudSkipped=@($script:cloudCopyPlan | Where-Object {$_.Reason} | ForEach-Object {"$($_.Name): $($_.Reason)"})
+        }
         $export.Enabled=$true; $enable.Enabled=$true
-        foreach ($c in $script:controls.Values) {$c.Enabled=$false}; $generate.Enabled=$false; $copy.Enabled=$false; $browseOU.Enabled=$false
+        foreach ($c in $script:controls.Values) {$c.Enabled=$false}; $generate.Enabled=$false; $copy.Enabled=$false; $browseOU.Enabled=$false; $sourceSearch.Enabled=$false; $managerSearch.Enabled=$false; $departmentSearch.Enabled=$false
         # Tenant ID can be supplied or corrected for the separate cloud step.
         $script:controls.Tenant.Enabled=$true
         Log "AD object created: $upn"
@@ -391,7 +590,8 @@ $enable.Add_Click({
         Log "Checking Entra for $($script:created.UPN). Sign in when prompted. If synchronization is pending, retry this button later."
         Import-Module Microsoft.Graph.Authentication
         $ctx=Get-MgContext
-        $needed=@('User.Read.All','Policy.ReadWrite.AuthenticationMethod')
+        $needed=@('User.Read.All','GroupMember.Read.All','Policy.ReadWrite.AuthenticationMethod')
+        if (@($script:created.CloudPlan | Where-Object {-not $_.Reason}).Count -gt 0) {$needed+=@('Group.Read.All','GroupMember.ReadWrite.All')}
         if (-not $ctx -or $ctx.TenantId -ne $script:created.Tenant -or @($needed | Where-Object {$_ -notin $ctx.Scopes}).Count -gt 0) {
             if ($ctx) {Disconnect-MgGraph | Out-Null}
             Connect-MgGraph -TenantId $script:created.Tenant -Scopes $needed -ContextScope Process -NoWelcome
@@ -405,17 +605,94 @@ $enable.Add_Click({
         if ($verify.perUserMfaState -notin @('enabled','enforced')) {throw 'MFA write was not confirmed by readback.'}
         $script:mfa="Enabled (verified per-user MFA state: $($verify.perUserMfaState); will be prompted to configure on sign-in, https://aka.ms/MFASetup/)"
         Log $script:mfa
+        $script:cloudCopyResults=@()
+        Apply-CloudCopy $cloud
         $mfaCompleted=$true
     } catch {$script:mfa="Pending / failed - $($_.Exception.Message)"; Log 'MFA incomplete. If the user is not found, wait for sync and retry.'; Log $_.Exception.Message}
     finally {$enable.Enabled=($null -ne $script:created); $another.Enabled=($null -ne $script:created); $export.Enabled=($null -ne $script:created); $f.UseWaitCursor=$false}
-    if ($mfaCompleted) { Export-AccountReport }
+    if ($mfaCompleted) { Start-ReportCountdown }
 })
+# A UI timer keeps the window responsive during the requested sync allowance.
+$script:reportTimer=New-Object Windows.Forms.Timer
+$script:reportTimer.Interval=1000
+$script:reportTimer.Add_Tick({
+    $remaining=[int][Math]::Ceiling(($script:reportDue-[DateTime]::UtcNow).TotalSeconds)
+    if ($remaining -gt 0) {
+        $export.Text="Export in $remaining seconds"
+        return
+    }
+    $script:reportTimer.Stop()
+    try { Export-AccountReport }
+    finally {
+        $script:exportWaiting=$false
+        $export.Text='Export text report'
+        $export.Enabled=($null -ne $script:created)
+        $another.Enabled=($null -ne $script:created)
+        $enable.Enabled=($null -ne $script:created)
+        $script:controls.Tenant.Enabled=$true
+    }
+})
+function Start-ReportCountdown {
+    if (-not $script:created -or $script:exportWaiting) {return}
+    $script:exportWaiting=$true
+    $script:reportDue=[DateTime]::UtcNow.AddSeconds(90)
+    $export.Enabled=$false; $another.Enabled=$false; $enable.Enabled=$false
+    $script:controls.Tenant.Enabled=$false
+    $export.Text='Export in 90 seconds'
+    Log 'Waiting 90 seconds before reading Entra group memberships and opening Save. This wait does not trigger directory sync.'
+    $script:reportTimer.Start()
+}
+function Get-ReportCloudGroups {
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    $tenant=[guid]::Empty
+    if (-not [guid]::TryParse($script:controls.Tenant.Text.Trim(),[ref]$tenant)) {throw 'Enter a valid tenant ID to read Entra groups.'}
+    # Preserve the account tenant captured at creation/MFA verification.
+    if ($tenant.ToString() -ne $script:created.Tenant) {throw 'Report tenant does not match the account tenant.'}
+    $ctx=Get-MgContext
+    $scopes=@('User.Read.All','GroupMember.Read.All')
+    if (-not $ctx -or $ctx.TenantId -ne $script:created.Tenant -or @($scopes | Where-Object {$_ -notin $ctx.Scopes}).Count -gt 0) {
+        if ($ctx) {Disconnect-MgGraph | Out-Null}
+        Connect-MgGraph -TenantId $script:created.Tenant -Scopes $scopes -ContextScope Process -NoWelcome
+    }
+    if ((Get-MgContext).TenantId -ne $script:created.Tenant) {throw 'Graph tenant mismatch.'}
+    $id=[uri]::EscapeDataString($script:created.UPN)
+    $cloud=Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/${id}?`$select=id,onPremisesSyncEnabled,onPremisesSecurityIdentifier"
+    if (-not $cloud.onPremisesSyncEnabled -or $cloud.onPremisesSecurityIdentifier -ne $script:created.SID) {throw 'Entra account is not the matching synced AD user.'}
+    $uri="https://graph.microsoft.com/v1.0/users/$($cloud.id)/transitiveMemberOf?`$select=id,displayName&`$top=999"
+    $groups=@()
+    do {
+        $page=Invoke-MgGraphRequest -Method GET -Uri $uri
+        foreach ($g in @($page.value)) {
+            if ($g.'@odata.type' -eq '#microsoft.graph.group') {
+                if (-not $g.displayName) {throw "Group $($g.id) has no readable display name; check Graph permissions."}
+                $groups+=[pscustomobject]@{Id=[string]$g.id; Name=[string]$g.displayName}
+            }
+        }
+        $uri=[string]$page.'@odata.nextLink'
+    } while ($uri)
+    return @($groups | Sort-Object Id -Unique)
+}
 function Export-AccountReport {
     try {
         if (-not $script:created) {throw 'Create an account before exporting a report.'}
         $u=Get-ADUser -Identity $script:created.Guid -Server $script:created.DC -Properties DisplayName,Description,Office,mail,Title,Department,Company,Manager,proxyAddresses,pwdLastSet,Enabled
         $groupNames=@(Get-ADPrincipalGroupMembership -Identity $u -Server $script:created.DC | Sort-Object Name | Select-Object -ExpandProperty Name)
-        $complete=if ($u.Enabled -and $script:mfa -like 'Enabled*' -and $script:issues.Count -eq 0) {'The following Account creation is complete, details are below'} else {'AD account creation details are below. Review pending actions and status before handing off.'}
+        $adGroupNames=$groupNames
+        $groupReadStatus=''
+        try {
+            $cloudGroups=@(Get-ReportCloudGroups)
+            $entraNames=@($cloudGroups | ForEach-Object {$_.Name})
+            $adOnly=@($adGroupNames | Where-Object {$_ -notin $entraNames})
+            $groupNames=@($cloudGroups | Sort-Object Name | ForEach-Object {$_.Name})
+            $groupNames+=@($adOnly)
+            $groupReadStatus="Entra groups read: $($cloudGroups.Count), including direct and nested memberships. Snapshot only; synchronization and dynamic group processing may still be pending. Hidden memberships require additional permissions. AD groups not returned by Entra are retained in the group list."
+            Log $groupReadStatus
+        } catch {
+            $groupNames=@($adGroupNames)
+            $groupReadStatus="INCOMPLETE: Entra groups could not be retrieved. AD groups only. $($_.Exception.Message)"
+            Log $groupReadStatus
+        }
+        $complete=if ($u.Enabled -and $script:mfa -like 'Enabled*' -and $script:issues.Count -eq 0 -and $groupReadStatus -notlike 'INCOMPLETE:*' -and @($script:cloudCopyResults | Where-Object {$_ -like 'FAILED*'}).Count -eq 0) {'The following Account creation is complete, details are below'} else {'AD account creation details are below. Review pending actions and status before handing off.'}
         $mfaReport=if ($script:mfa -like 'Enabled*') {'Enabled (Will be prompted to configure on first login, https://aka.ms/MFASetup/)'} else {$script:mfa}
         $txt=@"
 $complete
@@ -428,7 +705,7 @@ Do not pass/forward this information to the Employee/Contractor/Intern, if Hardw
 • Password: $($script:created.Password) (Will be prompted to change this on first login)
 • 2FA: $mfaReport
 • Office License(s): $($script:created.License)
-• Groups: $($groupNames -join '; ')
+• Groups: $($groupNames -join ', ')
 • 365 Role: N/A
 • Account Mimic'd: $($script:created.Mimic)
 • Additional Mailbox/Distribution Group Access: N/A
@@ -457,6 +734,9 @@ Intern / World Outreach (no optional groups): $($script:created.NoGroups)
 Created object GUID: $($u.ObjectGUID)
 Report generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')
 Pending / operation errors: $($script:issues -join '; ')
+Group retrieval status: $groupReadStatus
+Cloud copy outcomes: $($script:cloudCopyResults -join '; ')
+Cloud groups skipped: $($script:created.CloudSkipped -join '; ')
 License details are operator-entered; this tool does not assign or verify licenses.
 "@
         if ($complete -notlike 'The following*') {$txt=$txt.Replace('Although your account creation is complete,','The AD account has been created; review pending actions below. Also,') }
@@ -464,7 +744,7 @@ License details are operator-entered; this tool does not assign or verify licens
         if ($dlg.ShowDialog() -eq 'OK') {[IO.File]::WriteAllText($dlg.FileName,$txt,(New-Object Text.UTF8Encoding($true))); $script:reportSaved=$true; Log "Report exported: $($dlg.FileName)"}
     } catch {Log "Report failed: $($_.Exception.Message)"}
 }
-$export.Add_Click({ Export-AccountReport })
+$export.Add_Click({ Start-ReportCountdown })
 $another.Add_Click({
     if (-not $script:created) {return}
     if (-not $script:reportSaved) {
@@ -477,17 +757,20 @@ $another.Add_Click({
     $script:mfa='Pending - not yet enabled'
     $script:mimic='N/A'
     $script:copyIdentity=''
+    $script:cloudCopyPlan=@()
+    $script:cloudCopyResults=@()
     $script:issues.Clear()
     $script:groupServers.Clear()
     foreach ($c in $script:controls.Values) {$c.Enabled=$true}
     $script:controls.NoGroups.Checked=$false
-    foreach ($key in @('Mimic','First','Last','Full','Logon','Password','Description','Office','Email','Title','Department','Company','Manager','Proxy','Groups')) {$script:controls[$key].Clear()}
+    foreach ($key in @('Mimic','First','Last','Full','Logon','Password','Description','Office','Email','Title','Department','Company','Manager','Proxy','Groups')) {$script:controls[$key].Text=''}
     $script:controls.Proxy.Text='SMTP:'
     $script:previousDefaults=@()
     $script:groupsBeforeNoGroups=@()
     $script:copyGroupsBeforeNoGroups=$true
     $script:controls.CopyAttributes.Checked=$true
     $script:controls.CopyGroups.Checked=$true
+    $script:controls.CopyCloud.Checked=$true
     $script:controls.Change.Checked=$true
     $script:controls.MFA.Checked=$true
     $script:controls.Show.Checked=$false
@@ -495,7 +778,7 @@ $another.Add_Click({
     $script:controls.Notes.Text='N/A'
     Set-DefaultGroups
     Generate-Password
-    $generate.Enabled=$true; $copy.Enabled=$true; $browseOU.Enabled=$true
+    $generate.Enabled=$true; $copy.Enabled=$true; $browseOU.Enabled=$true; $sourceSearch.Enabled=$true; $managerSearch.Enabled=$true; $departmentSearch.Enabled=$true
     $create.Enabled=$true; $enable.Enabled=$false; $export.Enabled=$false; $another.Enabled=$false
     Log 'Ready for another user. Domain, OU and tenant selections retained; review them before creation.'
     $panel.ScrollControlIntoView($script:controls.First.Parent)
@@ -515,8 +798,10 @@ $fillDefaults = {
     if (-not $script:controls.Email.Text.Trim() -and $script:controls.Logon.Text.Trim()) { $script:controls.Email.Text = "$($script:controls.Logon.Text.Trim())@$($script:controls.Suffix.SelectedItem)" }
 }
 $script:controls.Logon.Add_Leave($fillDefaults)
-$f.Add_FormClosing({param($sender,$e) if ($script:created) {if ([Windows.Forms.MessageBox]::Show('Have you exported the report? Closing discards the password held in this window.','Close','YesNo','Question') -ne 'Yes') {$e.Cancel=$true}}})
+$f.Add_FormClosing({param($sender,$e) if ($script:exportWaiting) {$e.Cancel=$true; Log 'The report countdown is running. Wait for the Save dialog before closing.'; return}; if ($script:created) {if ([Windows.Forms.MessageBox]::Show('Have you exported the report? Closing discards the password held in this window.','Close','YesNo','Question') -ne 'Yes') {$e.Cancel=$true}}})
 Log 'Default groups follow the user logon UPN suffix. Use Browse / Refresh OUs to choose a location in sync scope. Enter details, then generate a password. Licenses are report-only.'
 Generate-Password
 [void]$f.ShowDialog()
+$script:reportTimer.Stop()
+$script:reportTimer.Dispose()
 $script:rng.Dispose()

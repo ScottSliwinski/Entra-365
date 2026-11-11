@@ -1,0 +1,11 @@
+Connect-MgGraph -Scopes "User.ReadWrite.All"
+Remove-MgUserPhoto -UserId alisonhowe@awmcharis.com
+Remove-MgUserPhoto -UserId amandaparker@awmcharis.com
+Remove-MgUserPhoto -UserId annadueck@awmcharis.com
+Remove-MgUserPhoto -UserId carolineolson@awmcharis.com
+Remove-MgUserPhoto -UserId charlesbishop@awmcharis.com
+Remove-MgUserPhoto -UserId dakotakott@awmcharis.com
+Remove-MgUserPhoto -UserId hosannaoettle@awmcharis.com
+Remove-MgUserPhoto -UserId joshuawilliams@awmcharis.com
+Remove-MgUserPhoto -UserId lukethomas@awmcharis.com
+Remove-MgUserPhoto -UserId ravenjewell@awmcharis.com
