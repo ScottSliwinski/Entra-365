@@ -1,3 +1,16 @@
+# Revision: r3
+# Revision Note: Added account search by name/email/UPN with explicit selection and object/tenant revalidation.
+# Baseline Status: CURRENT REVISION - r3 pending user verification; r1 confirmed working
+# Baseline Script: Offboard-EntraM365-GUI.ps1
+# Label Updated: 2026-11-16
+# Label Change: Searchable starting UPN; prior offboarding behavior retained.
+
+# Owner: Scott Sliwinski
+# Creator: Scott Sliwinski
+# Author: Scott Sliwinski
+# Website: https://www.caeitsolutions.com/
+# LinkedIn: https://www.linkedin.com/in/scottsliwinski/
+
 #requires -Version 7.2
 <#
 WINDOWS POWERSHELL 7 GUI - run in a fresh process:
@@ -228,13 +241,15 @@ $script:RunDir=$null;$script:Audit=[Collections.Generic.List[object]]::new()
 $form=[Windows.Forms.Form]::new();$form.Text='Hybrid AD / Entra / Microsoft 365 Offboarding';$form.Size=[Drawing.Size]::new(900,830);$form.StartPosition='CenterScreen'
 function Label($text,$y){$l=[Windows.Forms.Label]::new();$l.Text=$text;$l.Location=[Drawing.Point]::new(15,$y);$l.Size=[Drawing.Size]::new(845,22);$form.Controls.Add($l)}
 function Box($text,$y){$b=[Windows.Forms.TextBox]::new();$b.Text=$text;$b.Location=[Drawing.Point]::new(15,$y);$b.Size=[Drawing.Size]::new(845,25);$form.Controls.Add($b);return $b}
-Label 'User UPN to offboard:' 15;$upnBox=Box '' 40
+Label 'User to offboard (enter a UPN or use Search users):' 15;$upnBox=Box '' 40
+$upnBox.Width=665
+$searchUser=[Windows.Forms.Button]::new();$searchUser.Text='Search users...';$searchUser.SetBounds(695,38,165,29);$form.Controls.Add($searchUser)
 Label 'Report folder (a timestamped folder with the UPN will be created):' 73;$folderBox=Box ([Environment]::GetFolderPath('MyDocuments')+'\OffboardingReports') 98
 Label 'Optional calendar-only certificate app: Tenant ID | Client ID | Certificate thumbprint (leave blank for delegated access)' 131
 $appBox=Box '' 156
 Label 'Select cleanup steps. Each selected step still asks for confirmation. Exports run before cleanup.' 191
 $options=[ordered]@{}
-$names=@('Block sign-in (recommended)','Clear authentication methods','Delete Entra device objects (confirm each)','Clear all calendar entries (meeting cancellations may be sent)','Remove all inbox rules (including hidden rules)','Remove account photo','Remove cloud group memberships (confirm each)')
+$names=@('Block sign-in (recommended)','Clear authentication methods','Delete Entra device objects (confirm each)','Clear all calendar entries (meeting cancellations may be sent)','Remove all inbox rules (including hidden rules)','Remove account photo','Remove cloud group memberships (choose Remove All or confirm each)')
 $y=219
 foreach($name in $names){$cb=[Windows.Forms.CheckBox]::new();$cb.Text=$name;$cb.Location=[Drawing.Point]::new(15,$y);$cb.Size=[Drawing.Size]::new(840,23);$form.Controls.Add($cb);$options[$name]=$cb;$y+=25}
 $testBox=[Windows.Forms.CheckBox]::new();$testBox.Text='TEST MODE - preview and export only (no account changes)';$testBox.Checked=$true;$testBox.Location=[Drawing.Point]::new(15,402);$testBox.Size=[Drawing.Size]::new(840,25);$form.Controls.Add($testBox)
@@ -242,8 +257,9 @@ $hybridBox=[Windows.Forms.CheckBox]::new();$hybridBox.Text='Configure on-prem AD
 $oneDriveBox=[Windows.Forms.CheckBox]::new();$oneDriveBox.Text='Export OneDrive URL / optionally add a OneDrive site administrator';$oneDriveBox.SetBounds(15,460,840,24);$form.Controls.Add($oneDriveBox)
 $forwardBox=[Windows.Forms.CheckBox]::new();$forwardBox.Text='Ask about mail forwarding (one internal UPN)';$forwardBox.SetBounds(15,488,840,24);$form.Controls.Add($forwardBox)
 $mailAccessBox=[Windows.Forms.CheckBox]::new();$mailAccessBox.Text='Ask about granting mailbox Full Access (multiple UPNs)';$mailAccessBox.SetBounds(15,516,840,24);$form.Controls.Add($mailAccessBox)
-$run=[Windows.Forms.Button]::new();$run.Text='Verify user and run';$run.Location=[Drawing.Point]::new(15,550);$run.Size=[Drawing.Size]::new(190,32);$form.Controls.Add($run)
-$log=[Windows.Forms.TextBox]::new();$log.Multiline=$true;$log.ReadOnly=$true;$log.ScrollBars='Vertical';$log.Location=[Drawing.Point]::new(15,595);$log.Size=[Drawing.Size]::new(845,160);$form.Controls.Add($log)
+$autoReplyBox=[Windows.Forms.CheckBox]::new();$autoReplyBox.Text='Configure and enable offboarding automatic replies (contact name and email)';$autoReplyBox.Checked=$true;$autoReplyBox.SetBounds(15,544,840,24);$form.Controls.Add($autoReplyBox)
+$run=[Windows.Forms.Button]::new();$run.Text='Verify user and run';$run.Location=[Drawing.Point]::new(15,580);$run.Size=[Drawing.Size]::new(190,32);$form.Controls.Add($run)
+$log=[Windows.Forms.TextBox]::new();$log.Multiline=$true;$log.ReadOnly=$true;$log.ScrollBars='Vertical';$log.Location=[Drawing.Point]::new(15,625);$log.Size=[Drawing.Size]::new(845,130);$form.Controls.Add($log)
 function Log($Message){$line="$(Get-Date -Format s) $Message";$log.AppendText($line+[Environment]::NewLine);if($script:RunDir){Add-Content (Join-Path $script:RunDir 'Run.log') $line};$log.Refresh()}
 function Confirm($Message){[Windows.Forms.MessageBox]::Show($form,$Message,'Confirm offboarding action','YesNo','Warning','Button2') -eq 'Yes'}
 function Audit($Action,$Target,$Status,$Detail=''){
@@ -254,9 +270,30 @@ function Audit($Action,$Target,$Status,$Detail=''){
 function Csv($Name,$Rows,$Columns){$p=Join-Path $script:RunDir ($script:Safe+'_'+$Name+'.csv');$r=@($Rows);if($r.Count){$r|Select-Object $Columns|Export-Csv $p -NoTypeInformation -Encoding utf8}else{('"'+($Columns -join '","')+'"')|Set-Content $p -Encoding utf8};Log "Exported $Name ($($r.Count) rows)"}
 function Step($Name,$Work){try{& $Work;Audit $Name $script:UPN 'Completed'}catch{Audit $Name $script:UPN 'Failed' $_.Exception.Message}}
 # Hybrid additions: all writes go through HybridAction and the existing Test guard.
-function HybridAction($Name,$Target,$Detail,[scriptblock]$Work) {
+function Select-GroupRemovalMode([string]$Scope,[string[]]$GroupNames) {
+ if($script:TestRun){return 'Each'}
+ if(-not $GroupNames.Count){return 'Skip'}
+ $dialog=[Windows.Forms.Form]::new();$dialog.Text="$Scope group removal";$dialog.ClientSize=[Drawing.Size]::new(760,430);$dialog.StartPosition='CenterParent'
+ $intro=[Windows.Forms.Label]::new();$intro.Text="User: $script:UPN`n$($GroupNames.Count) selected direct $Scope group memberships. Removing groups may remove licenses and application access.";$intro.SetBounds(15,15,730,55);$dialog.Controls.Add($intro)
+ $preview=[Windows.Forms.TextBox]::new();$preview.Multiline=$true;$preview.ReadOnly=$true;$preview.ScrollBars='Vertical';$preview.Text=$GroupNames -join [Environment]::NewLine;$preview.SetBounds(15,80,730,265);$dialog.Controls.Add($preview)
+ $all=[Windows.Forms.Button]::new();$all.Text='Remove All';$all.SetBounds(15,365,225,40);$all.DialogResult='Yes';$dialog.Controls.Add($all)
+ $each=[Windows.Forms.Button]::new();$each.Text='Confirm Each Group';$each.SetBounds(260,365,225,40);$each.DialogResult='No';$dialog.Controls.Add($each)
+ $skip=[Windows.Forms.Button]::new();$skip.Text='Skip These Removals';$skip.SetBounds(505,365,240,40);$skip.DialogResult='Cancel';$dialog.Controls.Add($skip);$dialog.CancelButton=$skip;$dialog.AcceptButton=$each
+ try {
+  $choice=$dialog.ShowDialog($form)
+  $mode=switch([string]$choice){
+   'Yes' {'All'}
+   'No' {'Each'}
+   default {'Skip'}
+  }
+  Audit 'Group removal approval' $script:UPN $mode "$Scope; selected count=$($GroupNames.Count). Approval applies only to this list in this run."
+  return $mode
+ }finally{$dialog.Dispose()}
+}
+
+function HybridAction($Name,$Target,$Detail,[scriptblock]$Work,[bool]$RemovalBatchApproved=$false) {
  if($script:TestRun){Audit $Name $Target 'Would perform' $Detail;return}
- if(Confirm "$Name`nTarget: $Target`n$Detail"){
+ if(($RemovalBatchApproved -and $Name -eq 'AD group Remove') -or (Confirm "$Name`nTarget: $Target`n$Detail")){
   try{& $Work;Audit $Name $Target 'Completed' $Detail}catch{Audit $Name $Target 'Failed' $_.Exception.Message}
  }else{Audit $Name $Target 'Skipped' 'Administrator declined'}
 }
@@ -344,14 +381,18 @@ function HybridExecute($Plan,$User) {
   }
  }
  if(-not @($Plan.Changes).Count){Audit 'AD group changes' $ad.SamAccountName 'No changes selected' 'Existing groups were kept. In the Hybrid dialog, uncheck groups or click Remove all direct groups.'}
+ $adRemovalMode='Each'
+ $selectedRemovals=@($Plan.Changes|Where-Object {$_.Action -eq 'Remove'})
+ if($selectedRemovals.Count){$adRemovalMode=Select-GroupRemovalMode 'on-prem AD' @($selectedRemovals|ForEach-Object {"$($_.Group.Name) | $($_.Group.DistinguishedName)"})}
  foreach($c in $Plan.Changes){$g=$c.Group
+  if($c.Action -eq 'Remove' -and $adRemovalMode -eq 'Skip'){Audit 'AD group Remove' $g.DistinguishedName 'Skipped' 'Administrator skipped this removal batch';continue}
   HybridAction ("AD group "+$c.Action) $g.DistinguishedName "User: $($ad.SamAccountName). Group licensing and application access may change after synchronization." {
    $currentAD=Get-ADUser -Identity $id -Properties MemberOf @a
    if($c.Action -eq 'Add'){Add-ADGroupMember -Identity $g.ObjectGUID -Members $currentAD.DistinguishedName @a}else{Remove-ADGroupMember -Identity $g.ObjectGUID -Members $currentAD.DistinguishedName -Confirm:$false @a}
    $verifiedAD=Get-ADUser -Identity $id -Properties MemberOf @a
    $stillMember=$g.DistinguishedName -in @($verifiedAD.MemberOf)
    if(($c.Action -eq 'Remove' -and $stillMember) -or ($c.Action -eq 'Add' -and -not $stillMember)){throw 'AD group change could not be verified on the selected DC.'}
-  }
+  } -RemovalBatchApproved ($c.Action -eq 'Remove' -and $adRemovalMode -eq 'All')
  }
  Csv 'ADGroupResults' @($script:Audit|Where-Object {$_.Action -like 'AD group *'}) @('Time','UPN','Action','Target','Status','Detail')
  $after=Get-ADUser -Identity $id -Properties @('Description','Manager','MemberOf') @a
@@ -474,8 +515,144 @@ function MailboxHandover($Forward,$Access,[string]$SourceObjectId) {
  Csv 'MailboxHandover' $rows.ToArray() @('UPN','Action','RecipientUPN','Permission','KeepCopy','Status','Detail')
 }
 
+function New-OffboardingReplyText([string]$OffboardDisplayName,[string]$ContactDisplayName,[string]$ContactEmail) {
+ @"
+Hello,
+
+Thank you for your message. Please note that $OffboardDisplayName is no longer with Andrew Wommack Ministries.
+
+For immediate assistance or specific inquiries, please contact: $ContactDisplayName ($ContactEmail)
+
+Thank you for your understanding.
+
+Best regards,
+Andrew Wommack Ministries
+"@
+}
+function Normalize-OffboardingReply([string]$Message) {
+ $text=$Message -replace '(?i)<br\s*/?>',"`n" -replace '(?i)</(?:p|div)>',"`n" -replace '<[^>]*>',''
+ ([Net.WebUtility]::HtmlDecode($text) -replace '\s+',' ').Trim()
+}
+function Configure-OffboardingAutoReply([string]$OffboardUPN,[string]$OffboardObjectId,[string]$OffboardDisplayName) {
+ $replyStatus='Skipped';$replyDetail='Contact dialog cancelled';$contactName='';$contactEmail='';$replyText=''
+ try {
+  if([string]::IsNullOrWhiteSpace($OffboardDisplayName)){throw 'The verified account has no Display Name. Automatic replies were not changed.'}
+  $replyMailbox=Get-Mailbox -Identity $OffboardUPN -ErrorAction Stop
+  if([string]$replyMailbox.ExternalDirectoryObjectId -ne $OffboardObjectId){throw 'Automatic-reply mailbox does not match the verified Entra object ID.'}
+  $replyMailboxId=[string]$replyMailbox.ExchangeGuid
+  $beforeReply=Get-MailboxAutoReplyConfiguration -Identity $replyMailboxId -ErrorAction Stop
+  Csv 'AutoReplyBefore' @([pscustomobject]@{UPN=$OffboardUPN;AutoReplyState=[string]$beforeReply.AutoReplyState;ExternalAudience=[string]$beforeReply.ExternalAudience;InternalMessage=[string]$beforeReply.InternalMessage;ExternalMessage=[string]$beforeReply.ExternalMessage}) @('UPN','AutoReplyState','ExternalAudience','InternalMessage','ExternalMessage')
+  $replyDialog=[Windows.Forms.Form]::new();$replyDialog.Text='Offboarding automatic reply';$replyDialog.ClientSize=[Drawing.Size]::new(800,590);$replyDialog.StartPosition='CenterParent'
+  $sourceLabel=[Windows.Forms.Label]::new();$sourceLabel.Text="Mailbox: $OffboardUPN`nDisplay Name: $OffboardDisplayName";$sourceLabel.SetBounds(15,10,770,42);$replyDialog.Controls.Add($sourceLabel)
+  $nameLabel=[Windows.Forms.Label]::new();$nameLabel.Text='General contact Display Name (plain text):';$nameLabel.SetBounds(15,58,770,22);$replyDialog.Controls.Add($nameLabel)
+  $contactNameBox=[Windows.Forms.TextBox]::new();$contactNameBox.SetBounds(15,82,770,25);$replyDialog.Controls.Add($contactNameBox)
+  $emailLabel=[Windows.Forms.Label]::new();$emailLabel.Text='General contact email address (one address, plain text):';$emailLabel.SetBounds(15,114,770,22);$replyDialog.Controls.Add($emailLabel)
+  $contactEmailBox=[Windows.Forms.TextBox]::new();$contactEmailBox.SetBounds(15,138,770,25);$replyDialog.Controls.Add($contactEmailBox)
+  $previewLabel=[Windows.Forms.Label]::new();$previewLabel.Text='Preview - same message for internal senders and all external senders; enabled until turned off:';$previewLabel.SetBounds(15,177,770,24);$replyDialog.Controls.Add($previewLabel)
+  $replyPreview=[Windows.Forms.TextBox]::new();$replyPreview.Multiline=$true;$replyPreview.ReadOnly=$true;$replyPreview.ScrollBars='Vertical';$replyPreview.SetBounds(15,207,770,310);$replyDialog.Controls.Add($replyPreview)
+  $refreshReply={ $replyPreview.Text=New-OffboardingReplyText $OffboardDisplayName $contactNameBox.Text.Trim() $contactEmailBox.Text.Trim() }.GetNewClosure()
+  $contactNameBox.Add_TextChanged($refreshReply);$contactEmailBox.Add_TextChanged($refreshReply);& $refreshReply
+  $replyApply=[Windows.Forms.Button]::new();$replyApply.Text=if($script:TestRun){'Save test preview'}else{'Enable automatic replies'};$replyApply.SetBounds(385,540,240,32);$replyDialog.Controls.Add($replyApply)
+  $validateReply={
+   $candidateName=$contactNameBox.Text.Trim();$candidateEmail=$contactEmailBox.Text.Trim()
+   try {
+    if([string]::IsNullOrWhiteSpace($candidateName)){throw 'Enter the contact Display Name.'}
+    $parsedEmail=[Net.Mail.MailAddress]::new($candidateEmail)
+    if($parsedEmail.Address -ine $candidateEmail -or $candidateEmail -notmatch '^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$'){throw 'Enter one email address without a display name or separators.'}
+    $replyDialog.DialogResult='OK'
+   }catch{[Windows.Forms.MessageBox]::Show($replyDialog,$_.Exception.Message,'Contact details required')|Out-Null}
+  }.GetNewClosure()
+  $replyApply.Add_Click($validateReply)
+  $replyCancel=[Windows.Forms.Button]::new();$replyCancel.Text='Skip auto-reply';$replyCancel.SetBounds(640,540,145,32);$replyCancel.DialogResult='Cancel';$replyDialog.Controls.Add($replyCancel);$replyDialog.AcceptButton=$replyApply;$replyDialog.CancelButton=$replyCancel
+  try {
+   if($replyDialog.ShowDialog($form) -eq 'OK') {
+    $contactName=$contactNameBox.Text.Trim();$contactEmail=$contactEmailBox.Text.Trim()
+    $replyText=New-OffboardingReplyText $OffboardDisplayName $contactName $contactEmail
+    $replyText|Set-Content (Join-Path $script:RunDir ($script:Safe+'_AutoReplyMessage.txt')) -Encoding utf8
+    if($script:TestRun){$replyStatus='Would enable';$replyDetail='Preview only. Internal and all external senders; no end date.'}
+    elseif(Confirm "Enable automatic replies on $OffboardUPN?`nOffboarded Display Name: $OffboardDisplayName`nContact: $contactName ($contactEmail)`nThe previewed message will replace both existing replies and be enabled for internal and ALL external senders with no end date.") {
+     # Exchange stores reply bodies as HTML. Encode plain text and preserve line breaks.
+     $replyHtml='<html><body>'+([Net.WebUtility]::HtmlEncode($replyText) -replace '\r?\n','<br>')+'</body></html>'
+     Set-MailboxAutoReplyConfiguration -Identity $replyMailboxId -AutoReplyState Enabled -InternalMessage $replyHtml -ExternalMessage $replyHtml -ExternalAudience All -ErrorAction Stop
+     $replyStatus='Write completed; verification failed'
+     $afterReply=Get-MailboxAutoReplyConfiguration -Identity $replyMailboxId -ErrorAction Stop
+     $expectedReply=Normalize-OffboardingReply $replyHtml
+     if([string]$afterReply.AutoReplyState -ne 'Enabled' -or [string]$afterReply.ExternalAudience -ne 'All' -or (Normalize-OffboardingReply ([string]$afterReply.InternalMessage)) -cne $expectedReply -or (Normalize-OffboardingReply ([string]$afterReply.ExternalMessage)) -cne $expectedReply){throw 'Automatic-reply write returned, but the saved state or message did not match. Review the mailbox configuration.'}
+     $replyStatus='Enabled and verified';$replyDetail='Internal and all external senders; no end date.'
+    }else{$replyDetail='Final confirmation declined; existing replies retained.'}
+   }
+  }finally{$replyDialog.Dispose()}
+ }catch{if($replyStatus -ne 'Write completed; verification failed'){$replyStatus='Failed'};$replyDetail=$_.Exception.Message}
+ Audit 'Automatic replies' $OffboardUPN $replyStatus $replyDetail
+ Csv 'AutoReply' @([pscustomobject]@{UPN=$OffboardUPN;OffboardDisplayName=$OffboardDisplayName;ContactDisplayName=$contactName;ContactEmail=$contactEmail;RequestedState='Enabled';ExternalAudience='All';Message=$replyText;Status=$replyStatus;Detail=$replyDetail}) @('UPN','OffboardDisplayName','ContactDisplayName','ContactEmail','RequestedState','ExternalAudience','Message','Status','Detail')
+}
+
+function New-OffboardingUserSearchPath([string]$Query) {
+ $term=$Query.Trim()
+ if($term.Length -lt 2){throw 'Enter at least two characters of the name, email or UPN.'}
+ $escaped=$term.Replace("'","''")
+ $filter="startswith(displayName,'$escaped') or startswith(givenName,'$escaped') or startswith(surname,'$escaped') or startswith(mail,'$escaped') or startswith(userPrincipalName,'$escaped')"
+ 'users?'+ '$select=id,displayName,userPrincipalName,accountEnabled,onPremisesSyncEnabled&$top=100&$filter='+[uri]::EscapeDataString($filter)
+}
+function Select-OffboardingUser([string]$InitialQuery) {
+ Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+ Connect-GraphGui -Scopes @('User.Read.All','Directory.Read.All','User.Read')
+ $searchOrganizations=@(All 'organization?$select=id')
+ if($searchOrganizations.Count -ne 1){throw 'Cannot verify the directory used for account search.'}
+ $searchTenant=[string]$searchOrganizations[0].id
+ $picker=[Windows.Forms.Form]::new();$picker.Text='Find user to offboard';$picker.ClientSize=[Drawing.Size]::new(930,520);$picker.StartPosition='CenterParent'
+ $hint=[Windows.Forms.Label]::new();$hint.Text="Search by the beginning of a first name, surname, Display Name, email or UPN. Tenant: $searchTenant";$hint.SetBounds(15,12,900,35);$picker.Controls.Add($hint)
+ $queryBox=[Windows.Forms.TextBox]::new();$queryBox.Text=$InitialQuery;$queryBox.SetBounds(15,52,730,27);$picker.Controls.Add($queryBox)
+ $find=[Windows.Forms.Button]::new();$find.Text='Search';$find.SetBounds(760,50,155,30);$picker.Controls.Add($find)
+ $results=[Windows.Forms.ListView]::new();$results.View='Details';$results.FullRowSelect=$true;$results.MultiSelect=$false;$results.HideSelection=$false;$results.SetBounds(15,95,900,330);$picker.Controls.Add($results)
+ [void]$results.Columns.Add('Display Name',240);[void]$results.Columns.Add('UPN',380);[void]$results.Columns.Add('Enabled',90);[void]$results.Columns.Add('AD synced',100)
+ $status=[Windows.Forms.Label]::new();$status.Text='Enter a search and choose the correct account from the results.';$status.SetBounds(15,435,900,30);$picker.Controls.Add($status)
+ $select=[Windows.Forms.Button]::new();$select.Text='Use selected UPN';$select.Enabled=$false;$select.SetBounds(570,475,185,32);$picker.Controls.Add($select)
+ $cancel=[Windows.Forms.Button]::new();$cancel.Text='Cancel';$cancel.DialogResult='Cancel';$cancel.SetBounds(770,475,145,32);$picker.Controls.Add($cancel);$picker.CancelButton=$cancel;$picker.AcceptButton=$find
+ $find.Add_Click({
+  $find.Enabled=$false;$select.Enabled=$false;$results.Items.Clear();$picker.Tag=$null
+  try {
+   $searchPath=New-OffboardingUserSearchPath $queryBox.Text
+   $status.Text='Searching directory...';$status.Refresh()
+   $response=G $searchPath
+   $searchMatches=@($response.value|Where-Object {$_.id -and $_.userPrincipalName}|Sort-Object -Property @('displayName','userPrincipalName'))
+   foreach($match in $searchMatches){
+    $item=[Windows.Forms.ListViewItem]::new([string]$match.displayName)
+    [void]$item.SubItems.Add([string]$match.userPrincipalName);[void]$item.SubItems.Add([string]$match.accountEnabled);[void]$item.SubItems.Add([string]$match.onPremisesSyncEnabled)
+    $item.Tag=[pscustomobject]@{Id=[string]$match.id;UPN=[string]$match.userPrincipalName;TenantId=$searchTenant}
+    [void]$results.Items.Add($item)
+   }
+   $status.Text=if($response.'@odata.nextLink'){'Showing the first 100 results. Refine the search to narrow the list.'}elseif($searchMatches.Count){"$($searchMatches.Count) matching account(s). Select one, then click Use selected UPN."}else{'No matches. Try the beginning of the first name, surname or UPN.'}
+  }catch{$status.Text='Search failed: '+$_.Exception.Message}
+  finally{$find.Enabled=$true}
+ }.GetNewClosure())
+ $results.Add_SelectedIndexChanged({$select.Enabled=($results.SelectedItems.Count -eq 1)}.GetNewClosure())
+ $queryBox.Add_TextChanged({$results.Items.Clear();$select.Enabled=$false;$picker.Tag=$null;$status.Text='Search again to refresh the results.'}.GetNewClosure())
+ $choose={if($results.SelectedItems.Count -eq 1){$picker.Tag=$results.SelectedItems[0].Tag;$picker.DialogResult='OK'}}.GetNewClosure()
+ $select.Add_Click($choose);$results.Add_DoubleClick($choose)
+ try{if($picker.ShowDialog($form) -eq 'OK'){return $picker.Tag};return $null}finally{$picker.Dispose()}
+}
+$script:SearchSelection=$null
+$upnBox.Add_TextChanged({
+ if($script:SearchSelection -and $upnBox.Text.Trim() -ine $script:SearchSelection.UPN){$script:SearchSelection=$null}
+})
+$searchUser.Add_Click({
+ $searchUser.Enabled=$false;$run.Enabled=$false;$upnBox.Enabled=$false
+ try {
+  $picked=Select-OffboardingUser $upnBox.Text.Trim()
+  if($picked){$upnBox.Text=$picked.UPN;$script:SearchSelection=$picked}
+ }catch{[Windows.Forms.MessageBox]::Show($form,$_.Exception.Message,'User search failed')|Out-Null}
+ finally{
+  try{Disconnect-MgGraph -ErrorAction SilentlyContinue|Out-Null}catch{}
+  $script:ManualGraphToken=$null
+  $searchUser.Enabled=$true;$run.Enabled=$true;$upnBox.Enabled=$true
+ }
+})
+
 $run.Add_Click({
  $script:RunDir=$null
+ $searchUser.Enabled=$false
+ $autoReplySelected=$autoReplyBox.Checked;$autoReplyBox.Enabled=$false
  $forwardSelected=$forwardBox.Checked;$mailAccessSelected=$mailAccessBox.Checked;$forwardBox.Enabled=$false;$mailAccessBox.Enabled=$false
  $hybridSelected=$hybridBox.Checked;$oneDriveSelected=$oneDriveBox.Checked;$hybridBox.Enabled=$false;$oneDriveBox.Enabled=$false
  $script:TestRun=$testBox.Checked;$testBox.Enabled=$false
@@ -498,6 +675,7 @@ $run.Add_Click({
   $tenantInfo=@(All 'organization?$select=id')
   if($tenantInfo.Count -ne 1){throw 'Unable to verify the signed-in tenant.'}
   $context=@{Account=$me.userPrincipalName;TenantId=$tenantInfo[0].id}
+  if($script:SearchSelection -and ($uid -ne $script:SearchSelection.Id -or [string]$context.TenantId -ne $script:SearchSelection.TenantId)){throw 'The selected search result does not match the current account or tenant. Search again in the intended tenant. No offboarding changes started.'}
   if($me.id -eq $uid -or $context.Account -eq $script:UPN){throw 'Offboarding your signed-in administrator is blocked.'}
   if(-not(Confirm "Tenant: $($context.TenantId)`nUser: $($user.displayName)`nUPN: $script:UPN`nObject ID: $uid`nEnabled: $($user.accountEnabled)`nSynced: $($user.onPremisesSyncEnabled)`n`nMode: $(if($script:TestRun){'TEST - no account changes'}else{'LIVE - confirmed changes'})`n$(if($script:TestRun){'Inspect the user and export an action preview?'}else{'Verify both connections, revoke sessions, then export reports?'})")){return}
   $script:Safe=$script:UPN -replace '[<>:"/\\|?*\x00-\x1f]','_'
@@ -579,6 +757,7 @@ $run.Add_Click({
   }else{
    Audit 'Shared mailbox access scan' $script:UPN 'Skipped' 'Administrator declined. Shared mailbox permissions were not inspected; access CSVs were not created.'
   }
+  if($autoReplySelected){Configure-OffboardingAutoReply -OffboardUPN $script:UPN -OffboardObjectId $uid -OffboardDisplayName $user.displayName}else{Audit 'Automatic replies' $script:UPN 'Skipped' 'Option unchecked; existing automatic replies retained.'}
   if($forwardSelected -or $mailAccessSelected){Step 'Mailbox handover' {MailboxHandover $forwardSelected $mailAccessSelected $uid}}
   if($hybridPlan){Step 'Hybrid AD actions' {HybridExecute $hybridPlan $user}}
   if($oneDriveSelected){Step 'OneDrive access' {OneDriveAccess}}
@@ -699,12 +878,15 @@ $run.Add_Click({
    }
   }
   if($options[$names[5]].Checked -and (Confirm "Remove the account photo for $script:UPN?")){Step 'Remove photo' {G "users/$uid/photo/`$value" DELETE|Out-Null}}
-  if($options[$names[6]].Checked -and (Confirm "Review and remove direct cloud group memberships for $script:UPN?`nThis may remove group-based licenses, Teams access and enterprise application access. Synced/dynamic memberships are skipped. Each eligible group asks separately.")){
+  if($options[$names[6]].Checked){
    Step 'Cloud group cleanup' {
     $current=@(All "users/$uid/memberOf/microsoft.graph.group?`$select=id,displayName,groupTypes,mailEnabled,securityEnabled,onPremisesSyncEnabled,isAssignableToRole,mail")
+    $eligibleCloud=@($current|Where-Object {-not $_.onPremisesSyncEnabled -and 'DynamicMembership' -notin $_.groupTypes})
+    $cloudRemovalMode=Select-GroupRemovalMode 'cloud' @($eligibleCloud|ForEach-Object {"$($_.displayName) | $($_.id)"})
     foreach($g in $current){
      if($g.onPremisesSyncEnabled -or 'DynamicMembership' -in $g.groupTypes){Audit 'Remove group membership' $g.displayName 'Skipped' 'Synced or dynamic group';continue}
-     if(-not(Confirm "Remove $script:UPN from $($g.displayName)?`nGroup ID: $($g.id)`nRole-assignable: $($g.isAssignableToRole)`nGroup-based licensing and application access can be lost.")){Audit 'Remove group membership' $g.displayName 'Skipped' 'Administrator declined';continue}
+     if($cloudRemovalMode -eq 'Skip'){Audit 'Remove group membership' $g.displayName 'Skipped' 'Administrator skipped this removal batch';continue}
+     if($cloudRemovalMode -ne 'All' -and -not(Confirm "Remove $script:UPN from $($g.displayName)?`nGroup ID: $($g.id)`nRole-assignable: $($g.isAssignableToRole)`nGroup-based licensing and application access can be lost.")){Audit 'Remove group membership' $g.displayName 'Skipped' 'Administrator declined';continue}
      try{
       if($g.mailEnabled -and 'Unified' -notin $g.groupTypes){
        $dg=Get-DistributionGroup -Identity $g.id
@@ -723,6 +905,8 @@ $run.Add_Click({
  }catch{Log "STOPPED: $($_.Exception.Message)";[Windows.Forms.MessageBox]::Show($form,$_.Exception.Message,'Stopped')|Out-Null}
  finally{
   if($script:ManualGraphToken){try{Disconnect-MgGraph -ErrorAction SilentlyContinue|Out-Null}catch{};$script:ManualGraphToken=$null}
+  $searchUser.Enabled=$true
+  $autoReplyBox.Enabled=$true
   $hybridBox.Enabled=$true;$oneDriveBox.Enabled=$true;$forwardBox.Enabled=$true;$mailAccessBox.Enabled=$true
   $testBox.Enabled=$true;$run.Enabled=$true;$upnBox.Enabled=$true;$folderBox.Enabled=$true;$appBox.Enabled=$true
   foreach($cb in $options.Values){$cb.Enabled=$true}

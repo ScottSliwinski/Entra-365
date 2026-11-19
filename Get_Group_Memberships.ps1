@@ -1,7 +1,7 @@
 # Replace "user@domain.com" with the UPN
 Connect-MgGraph -Scopes "User.Read.All","GroupMember.Read.All"
 
-Get-MgUserMemberOf -UserId "charlettegitonga@awmi.net" |
+Get-MgUserMemberOf -UserId "kelseybrave@awmcharis.com" |
     Where-Object {$_.AdditionalProperties['displayName']} |
     Select-Object -ExpandProperty AdditionalProperties |
     ForEach-Object { $_['displayName'] } |

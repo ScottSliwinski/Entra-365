@@ -1,4 +1,17 @@
-﻿#Requires -Version 5.1
+﻿# Revision: r2
+# Revision Note: Exclude Domain Users from the exported Groups field.
+# Baseline Status: BASELINE - current reference; validation not recorded
+# Baseline Script: New-HybridUser-GUI.ps1
+# Label Updated: 2026-11-11
+# Label Change: Report formatting only; group memberships unchanged.
+
+# Owner: Scott Sliwinski
+# Creator: Scott Sliwinski
+# Author: Scott Sliwinski
+# Website: https://www.caeitsolutions.com/
+# LinkedIn: https://www.linkedin.com/in/scottsliwinski/
+
+#Requires -Version 5.1
 <#
 Run on Windows with RSAT ActiveDirectory, as an operator delegated to create users.
 Launch: powershell.exe -NoProfile -STA -File .\New-HybridUser-GUI.ps1
@@ -692,6 +705,8 @@ function Export-AccountReport {
             $groupReadStatus="INCOMPLETE: Entra groups could not be retrieved. AD groups only. $($_.Exception.Message)"
             Log $groupReadStatus
         }
+        # Report-only exclusion; do not alter actual AD or Entra memberships.
+        $groupNames=@($groupNames | Where-Object {$_ -ine 'Domain Users'})
         $complete=if ($u.Enabled -and $script:mfa -like 'Enabled*' -and $script:issues.Count -eq 0 -and $groupReadStatus -notlike 'INCOMPLETE:*' -and @($script:cloudCopyResults | Where-Object {$_ -like 'FAILED*'}).Count -eq 0) {'The following Account creation is complete, details are below'} else {'AD account creation details are below. Review pending actions and status before handing off.'}
         $mfaReport=if ($script:mfa -like 'Enabled*') {'Enabled (Will be prompted to configure on first login, https://aka.ms/MFASetup/)'} else {$script:mfa}
         $txt=@"
